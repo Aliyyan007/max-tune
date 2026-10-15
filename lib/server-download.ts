@@ -12,7 +12,7 @@ import ffmpegPath from 'ffmpeg-static';
 import { adapters } from './platforms';
 import { resolveDeezerTrack, decryptDeezerFile, blowfishKey } from './platforms/deezer';
 import { resolveTidalTrack } from './platforms/tidal';
-import { downloadSpotifyNative, downloadAppleNative, downloadAmazonNative, resolveAmazonStream, PY_ENV, withLibrespotLock } from './platforms/native-tools';
+import { downloadSpotifyNative, downloadAppleNative, downloadAmazonNative, resolveAmazonStream, PY_ENV, PY_BIN, withLibrespotLock } from './platforms/native-tools';
 import { Blowfish } from 'egoroof-blowfish';
 import type { PlatformSource, RequestContext } from './platforms/types';
 
@@ -436,7 +436,7 @@ async function* dashGen(mpd: string): AsyncGenerator<Buffer> {
 // Spawn a librespot session streaming straight to stdout (spotify-native.py '-' mode)
 function spotifyStdout(trackId: string, quality: string, creds: string): ChildProcessWithoutNullStreams {
     const args = [path.join(process.cwd(), 'tools', 'spotify-native.py'), trackId, '-', '--quality', quality, '--creds', creds];
-    return spawn('python', args, { env: { ...process.env, ...PY_ENV }, windowsHide: true });
+    return spawn(PY_BIN, args, { env: { ...process.env, ...PY_ENV }, windowsHide: true });
 }
 
 // Resolve the raw audio stream for a source. Returns null for file-based natives

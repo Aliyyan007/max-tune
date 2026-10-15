@@ -87,6 +87,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // protobuf 6.x (pywidevine dep) rejects librespot's old generated _pb2 files —
 // the pure-python impl accepts both generations.
 export const PY_ENV = { PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: 'python' };
+// Docker images install the tools into their own venv (dependency conflicts) —
+// NATIVE_PYTHON points at it; falls back to system python.
+export const PY_BIN = process.env.NATIVE_PYTHON || 'python';
 
 // Serialize every librespot-session spawn — Spotify's AP drops concurrent sessions on
 // the same account (RemoteDisconnected), so parallel python calls kill each other.
@@ -122,7 +125,7 @@ export async function downloadSpotifyNative(trackId: string, quality: 'normal' |
     let lastErr: any = null;
     for (let attempt = 1; attempt <= SPOTIFY_ATTEMPTS; attempt++) {
         try {
-            const line = await withLibrespotLock(() => runNativeTool('python', args, PY_ENV, SPOTIFY_ATTEMPT_TIMEOUT));
+            const line = await withLibrespotLock(() => runNativeTool(PY_BIN, args, PY_ENV, SPOTIFY_ATTEMPT_TIMEOUT));
             const result = parseNativeResult(line);
             if (!fs.existsSync(result.file)) throw new Error('tool produced no file');
             return result;
@@ -365,7 +368,7 @@ export async function amazonWidevineKey(pssh: string, token: string, rid = '', a
         if (!e?.message?.includes('__GATEWAY_NO_WVD__')) throw e;
     }
     // Local path — needs a .wvd the user dropped into data/
-    const line = await runNativeTool('python', [path.join(process.cwd(), 'tools', 'amz-license.py'), pssh, '--rid', rid, '--asin', asin], PY_ENV, 60000);
+    const line = await runNativeTool(PY_BIN, [path.join(process.cwd(), 'tools', 'amz-license.py'), pssh, '--rid', rid, '--asin', asin], PY_ENV, 60000);
     const m = line.trim().match(/^([0-9a-fA-F]{32}):([0-9a-fA-F]{32})$/);
     if (!m) throw new Error(`license tool returned unexpected output: ${line.slice(0, 200)}`);
     return m[2]; // the content key hex
