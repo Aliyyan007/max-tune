@@ -53,7 +53,7 @@ const isValidSettings = (obj: any): obj is SettingsProps => {
 
 // Sensible per-platform defaults — each platform's native codec/tier, no fake conversions.
 export const platformDefaults: Record<PlatformSource, PlatformOutput> = {
-    qobuz: { outputQuality: '27', outputCodec: 'FLAC', bitrate: 320 },
+    qobuz: { outputQuality: '27', outputCodec: 'SOURCE', bitrate: 320 },
     deezer: { outputQuality: '7', outputCodec: 'SOURCE', bitrate: 320 },
     tidal: { outputQuality: '27', outputCodec: 'SOURCE', bitrate: 320 },
     spotify: { outputQuality: '7', outputCodec: 'SOURCE', bitrate: 320 },

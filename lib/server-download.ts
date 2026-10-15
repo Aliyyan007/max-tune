@@ -2,7 +2,7 @@
 // bytes the browser can take over natively (a[download] → Chrome download manager).
 // Replaces the old client-side ffmpeg.wasm + in-memory blob flow.
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
-import { Readable, Transform } from 'stream';
+import { PassThrough, Readable, Transform } from 'stream';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -63,8 +63,11 @@ export function normalizeArtUrl(url?: string): string | undefined {
     const proxyMatch = url.match(/\/api\/image-proxy\?url=([^&]+)/);
     if (proxyMatch) url = decodeURIComponent(proxyMatch[1]);
     if (!url.startsWith('http')) return undefined;
-    if (/\/\d+x\d+(bb)?\./.test(url)) return url.replace(/\/\d+x\d+(bb)?\./, '/1400x1400bb.');
-    if (/_\d+\.jpg$/.test(url)) return url.replace(/_\d+\.jpg$/, '_org.jpg');
+    // per-host max-size rules — a generic /WxH→bb rewrite 404s on non-Apple CDNs
+    if (/mzstatic\.com/.test(url)) return url.replace(/\/\d+x\d+(bb)?\./, '/1400x1400bb.');
+    if (/resources\.tidal\.com/.test(url)) return url.replace(/\/\d+x\d+\./, '/1280x1280.');
+    if (/images\.qobuz\.com|static\.qobuz\.com/.test(url) && /_\d+\.jpg$/.test(url)) return url.replace(/_\d+\.jpg$/, '_org.jpg');
+    if (/cdn-images\.dzcdn\.net|e-cdns-images\.dzcdn\.net/.test(url)) return url.replace(/\/\d+x\d+-/, '/1200x1200-');
     return url;
 }
 
@@ -87,6 +90,43 @@ export function flacPictureBlock(art: Buffer, mime = 'image/jpeg'): string {
 
 // Escape for FFMETADATA1 format (\ = ; # and newlines are reserved)
 const metaEsc = (s: string) => s.replace(/\\/g, '\\\\').replace(/\n/g, ' ').replace(/([=;#])/g, '\\$1');
+
+// ---------------- ID3v2.3 builder ----------------
+// ffmpeg writes an ID3 tag on unseekable pipe output with a ZERO size field
+// (it can't seek back to patch it) — players/ffprobe then reject the file.
+// Fix: strip muxer tags (-id3v2_version 0) and prepend a complete tag we build.
+const syncsafe4 = (n: number) => Buffer.from([(n >>> 21) & 0x7f, (n >>> 14) & 0x7f, (n >>> 7) & 0x7f, n & 0x7f]);
+const be32 = (n: number) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32BE(n);
+    return b;
+};
+const id3Frame = (id: string, payload: Buffer) => Buffer.concat([Buffer.from(id, 'latin1'), be32(payload.length), Buffer.alloc(2), payload]);
+const id3Text = (id: string, text: string) => id3Frame(id, Buffer.concat([Buffer.from([0x03]), Buffer.from(text, 'utf8')]));
+
+export function buildId3v2(spec: DownloadSpec, art?: Buffer | null, artMime = 'image/jpeg'): Buffer {
+    const frames: Buffer[] = [];
+    const add = (id: string, v?: string | number) => {
+        if (v !== undefined && v !== null && String(v) !== '') frames.push(id3Text(id, String(v)));
+    };
+    add('TIT2', spec.title);
+    add('TPE1', spec.artist);
+    add('TPE2', spec.artist);
+    add('TALB', spec.album || spec.title);
+    add('TCON', spec.genre);
+    add('TDRC', spec.date || spec.year);
+    add('TRCK', spec.trackNum ? String(spec.totalTracks ? `${spec.trackNum}/${spec.totalTracks}` : spec.trackNum) : undefined);
+    add('TPOS', spec.discNum);
+    add('TPUB', spec.label);
+    add('TCOP', spec.copyright);
+    add('TSRC', spec.isrc);
+    if (art?.length) {
+        const apic = Buffer.concat([Buffer.from([0x03]), Buffer.from(artMime + '\0', 'latin1'), Buffer.from([3]), Buffer.from('\0', 'latin1'), art]);
+        frames.push(id3Frame('APIC', apic));
+    }
+    const body = Buffer.concat(frames);
+    return Buffer.concat([Buffer.from('ID3\x03\x00\x00', 'latin1'), syncsafe4(body.length), body]);
+}
 
 async function fetchBuf(url: string, headers: Record<string, string> = {}): Promise<Buffer> {
     const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 300000, headers, maxRedirects: 5 });
@@ -252,12 +292,15 @@ function probeAudioCodec(file: string): Promise<string> {
 export async function tagAndEncode(input: Buffer, inputFormat: string, spec: DownloadSpec): Promise<{ data: Buffer; ext: string }> {
     let inExt = EXT_OF_FORMAT[inputFormat] ?? 'flac';
     const sourceMode = spec.codec === 'SOURCE';
-    // mp4-family containers can secretly carry FLAC — remux to .flac, not .m4a
-    if (sourceMode && ['m4a', 'mp4'].includes(inExt)) {
-        const probeFile = path.join(os.tmpdir(), `probe-${Date.now()}.${inExt}`);
+    // Manifests lie about containers (Tidal fMP4+FLAC, Qobuz "flac" = mp3) —
+    // in source mode, probe the real codec and pick the matching extension.
+    if (sourceMode) {
+        const probeFile = path.join(os.tmpdir(), `probe-${crypto.randomBytes(6).toString('hex')}.${inExt}`);
         try {
             fs.writeFileSync(probeFile, input);
-            if ((await probeAudioCodec(probeFile)) === 'flac') inExt = 'flac';
+            const codec = await probeAudioCodec(probeFile);
+            const CODEC_EXT: Record<string, string> = { flac: 'flac', mp3: 'mp3', aac: 'm4a', alac: 'm4a', eac3: 'm4a', vorbis: 'ogg', opus: 'ogg', pcm_s16le: 'wav', pcm_s24le: 'wav' };
+            if (codec && CODEC_EXT[codec]) inExt = CODEC_EXT[codec];
         } catch {
         } finally {
             try {
@@ -604,11 +647,34 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string): Pro
     // header. Those take the buffered path; flac/mp3/ogg-family stream cleanly.
     const streamable = ['flac', 'mp3', 'ogg', 'opus', 'webm'].includes(outExt);
     if (!up || !streamable) {
-        up?.stream.destroy();
-        up?.cleanup?.();
         prog({ stage: 'downloading' });
-        const { data, format } = await produceTrackBytes(spec);
+        let data: Buffer, format: string, decryptKey: string | undefined;
+        if (up) {
+            // drain the already-resolved stream — avoids a second resolve/license call
+            const chunks: Buffer[] = [];
+            for await (const c of up.stream) chunks.push(c as Buffer);
+            up.cleanup?.();
+            data = Buffer.concat(chunks);
+            format = up.format;
+            decryptKey = up.decryptKey;
+        } else {
+            ({ data, format } = await produceTrackBytes(spec));
+        }
         prog({ stage: 'processing', received: data.length, total: data.length });
+        // encrypted segments (amazon m4a) get decrypted in a first pass
+        if (decryptKey) {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dec-'));
+            try {
+                const enc = path.join(dir, `in.${EXT_OF_FORMAT[format] ?? 'mp4'}`);
+                const dec = path.join(dir, 'dec.mp4');
+                fs.writeFileSync(enc, data);
+                await runFfmpeg(['-y', '-decryption_key', decryptKey, '-i', enc, '-c', 'copy', dec]);
+                data = fs.readFileSync(dec);
+                format = 'mp4';
+            } finally {
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
+        }
         const { data: out, ext } = await tagAndEncode(data, format, spec);
         prog({ stage: 'sending' });
         const body = jobId ? Readable.from(out).pipe(countingTransform(jobId, 'sent')) : Readable.from(out);
@@ -634,10 +700,13 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string): Pro
             } catch {}
         }
         const vorbisArt = ['ogg', 'opus'].includes(outExt);
+        // mp3 tags go in via a hand-built ID3v2 block prepended to the stream —
+        // ffmpeg's mp3 muxer writes a broken size-0 tag on unseekable pipes.
+        const mp3Out = outExt === 'mp3';
 
         let inputIdx = 1;
         let metaInput = -1;
-        if (doTags) {
+        if (doTags && !mp3Out) {
             const artists = spec.artist || 'Various Artists';
             let meta = ';FFMETADATA1';
             meta += `\ntitle=${metaEsc(spec.title)}`;
@@ -662,13 +731,14 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string): Pro
 
         const artFile = path.join(dir, 'art.jpg');
         let artInput = -1;
-        if (artBuf && !vorbisArt) {
+        if (artBuf && !vorbisArt && !mp3Out) {
             fs.writeFileSync(artFile, artBuf);
             args.push('-i', artFile);
             artInput = inputIdx++;
         }
 
         if (metaInput >= 0) args.push('-map_metadata', String(metaInput));
+        if (mp3Out) args.push('-map_metadata', '-1'); // strip source tags — we prepend our own
         args.push('-map', '0:a');
         if (artInput >= 0) args.push('-map', String(artInput), '-c:v', 'copy', '-disposition:v:0', 'attached_pic');
         if (skipRecode) args.push('-c', 'copy');
@@ -679,6 +749,7 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string): Pro
         }
         const outFmt = OUT_FMT[outExt] ?? outExt;
         if (outFmt === 'mp4') args.push('-movflags', '+frag_keyframe+empty_moov+default_base_moof');
+        if (mp3Out) args.push('-id3v2_version', '0'); // no muxer tag — prepended manually
         args.push('-f', outFmt, 'pipe:1');
 
         const proc = spawn(ffmpegBin(), args, { windowsHide: true });
@@ -696,13 +767,23 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string): Pro
         proc.stdout.on('close', cleanup);
         proc.on('close', (code) => {
             cleanup();
-            if (jobId) prog(code === 0 ? { stage: 'done' } : { stage: 'error', error: errTail.trim().slice(-300) || `ffmpeg exited ${code}` });
+            // not 'done' — bytes still need to flush to the client; the route's
+            // relay sets 'done' when the response body actually drains.
+            if (jobId) prog(code === 0 ? { stage: 'sending' } : { stage: 'error', error: errTail.trim().slice(-300) || `ffmpeg exited ${code}` });
         });
         // upstream bytes → 'downloading'; ffmpeg output → 'sending'
         const inCounted = jobId ? up.stream.pipe(countingTransform(jobId, 'received', 'downloading')) : up.stream;
         inCounted.pipe(proc.stdin);
         proc.stdin.on('error', () => {}); // EPIPE when ffmpeg dies early
-        const outBody = jobId ? proc.stdout.pipe(countingTransform(jobId, 'sent', 'sending')) : proc.stdout;
+        // mp3 gets a real ID3v2 header prepended before ffmpeg's raw frames
+        let rawOut: Readable = proc.stdout;
+        if (mp3Out && doTags) {
+            const merged = new PassThrough();
+            merged.write(buildId3v2(spec, artBuf));
+            proc.stdout.pipe(merged);
+            rawOut = merged;
+        }
+        const outBody = jobId ? rawOut.pipe(countingTransform(jobId, 'sent', 'sending')) : rawOut;
         outBody.on('error', (e: any) => prog({ stage: 'error', error: e?.message ?? 'ffmpeg stream error' }));
         return { body: outBody, ext: outExt, cleanup };
     } catch (e) {
@@ -732,6 +813,11 @@ const progressMap: Map<string, JobProgress> = (globalThis.__dlProgress ??= new M
 const PROGRESS_TTL = 5 * 60 * 1000;
 export function setProgress(id: string, patch: Partial<JobProgress>) {
     const p = progressMap.get(id) ?? { stage: 'queued', received: 0, sent: 0, at: Date.now() };
+    // terminal stages are sticky — a late 'close' event mustn't regress done→sending
+    if ((p.stage === 'done' || p.stage === 'error') && patch.stage && patch.stage !== 'done' && patch.stage !== 'error') {
+        const { stage: _stage, ...rest } = patch;
+        patch = rest;
+    }
     Object.assign(p, patch);
     p.at = Date.now();
     progressMap.set(id, p);
@@ -794,4 +880,11 @@ export function takeJob(id: string): StoredJob | null {
     if (!j) return null;
     jobs.delete(id);
     return Date.now() - j.at <= JOB_TTL ? j : null;
+}
+
+// live counters for the admin panel — active = not yet terminal/cancelled
+export function jobStats() {
+    let active = 0;
+    for (const p of progressMap.values()) if (p.stage !== 'done' && p.stage !== 'error' && !p.cancelled) active++;
+    return { active, total: progressMap.size, queued: jobs.size };
 }

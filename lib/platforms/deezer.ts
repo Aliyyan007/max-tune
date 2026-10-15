@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { pickToken, reportToken } from '@/lib/token-pool';
 import crypto from 'node:crypto';
 import { Blowfish } from 'egoroof-blowfish';
 import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
@@ -187,9 +188,13 @@ async function getTrackData(sngId: string, session: DeezerSession) {
 }
 
 export async function resolveDeezerTrack(sngId: string, quality: QualityId, ctx: RequestContext) {
-    const arl = ctx.tokens.deezerArl || process.env.DEEZER_ARL || '';
-    if (!arl) throw new Error('Deezer requires your ARL cookie — add it in Settings → Service Tokens (or DEEZER_ARL env)');
-    const session = await getSession(arl);
+    const arl = pickToken('deezer') || ctx.tokens.deezerArl || process.env.DEEZER_ARL || '';
+    if (!arl) throw new Error('Deezer requires an ARL cookie — configure one in the admin panel (or DEEZER_ARL env)');
+    const session = await getSession(arl).catch((e: any) => {
+        reportToken('deezer', arl, false, e?.message);
+        throw e;
+    });
+    reportToken('deezer', arl, true);
     const data = await getTrackData(sngId, session);
     const trackToken = data.TRACK_TOKEN;
     if (!trackToken) throw new Error('Deezer did not return a track token (track unavailable or ARL expired)');

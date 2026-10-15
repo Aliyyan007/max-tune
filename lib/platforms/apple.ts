@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { pickToken } from '@/lib/token-pool';
 import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, QualityId, RequestContext } from './types';
 import type { FetchedQobuzAlbum, QobuzAlbum, QobuzTrack } from '@/lib/qobuz-dl';
@@ -172,7 +173,7 @@ export const appleAdapter: PlatformAdapter = {
             duration = Math.round((t?.trackTimeMillis ?? 0) / 1000) || duration;
         } catch {}
         // Real ALAC/AAC via amdl + wrapper — requires a media-user-token
-        if (ctx.tokens.appleMediaToken || process.env.APPLE_MEDIA_USER_TOKEN) {
+        if (pickToken('apple') || ctx.tokens.appleMediaToken || process.env.APPLE_MEDIA_USER_TOKEN) {
             const params = new URLSearchParams({ source: 'apple-native', id: trackId, quality, title, artist });
             if (duration) params.set('dur', String(duration));
             return { url: `/api/stream-audio?${params}`, format: 'm4a' };

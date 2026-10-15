@@ -1,3 +1,4 @@
+import AdminPanel from '@/components/admin-panel';
 import ChangelogDialog from '@/components/ui/changelog-dialog';
 import ParticlesComponent from '@/components/particles';
 import SettingsForm from '@/components/ui/settings-form';
@@ -102,6 +103,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
                                         </main>
                                         <Toaster />
                                         <StatusBarContainer />
+                                        <AdminPanel />
                                     </div>
                                 </ThemeProvider>
                             </SettingsProvider>

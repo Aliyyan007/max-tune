@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { pickToken } from '@/lib/token-pool';
 import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
 import { hasSpotifyNativeCreds } from './native-tools';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, RequestContext } from './types';
@@ -15,8 +16,14 @@ const MARKET = 'US';
 let appToken: { token: string; expiresAt: number } | null = null;
 
 function creds(ctx: RequestContext): { id?: string; secret?: string } {
+    // Pool entries may carry a 'clientId:clientSecret' composite for rotation
+    const pooled = pickToken('spotify');
+    if (pooled?.includes(':')) {
+        const [id, ...rest] = pooled.split(':');
+        return { id, secret: rest.join(':') };
+    }
     return {
-        id: ctx.tokens.spotifyId || process.env.SPOTIFY_CLIENT_ID,
+        id: ctx.tokens.spotifyId || process.env.SPOTIFY_CLIENT_ID || pooled,
         secret: ctx.tokens.spotifySecret || process.env.SPOTIFY_CLIENT_SECRET
     };
 }

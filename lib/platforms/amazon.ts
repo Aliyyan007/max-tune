@@ -1,4 +1,5 @@
 ﻿import axios from 'axios';
+import { pickToken } from '@/lib/token-pool';
 import fs from 'fs';
 import path from 'path';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -39,7 +40,7 @@ async function getConfig(): Promise<AmazonConfig> {
 
 // ------------------ gateway (account token) ------------------
 
-const amazonToken = (ctx: RequestContext) => ctx.tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN || '';
+const amazonToken = (ctx: RequestContext) => pickToken('amazon') || ctx.tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN || '';
 
 // The JWT caps at 30d, but the exported website cookies live for months — store the
 // session export once (data/amazon-session.json) and re-mint fresh JWTs on 401s.

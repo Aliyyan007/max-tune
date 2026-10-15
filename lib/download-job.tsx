@@ -5,7 +5,7 @@ import { formatCustomTitle } from './utils';
 import { createJob } from './status-bar/jobs';
 import { Disc3Icon, DiscAlbumIcon } from 'lucide-react';
 import { FetchedQobuzAlbum, formatArtists, formatTitle, QobuzAlbum, QobuzArtistResults, QobuzTrack } from './qobuz-dl';
-import { serviceHeaders, getServiceTokens } from './service-tokens';
+import { serviceHeaders } from './service-tokens';
 import { outputFor, SettingsProps } from './settings-provider';
 import { StatusBarProps } from '@/components/status-bar/status-bar';
 import { ToastAction } from '@/components/ui/toast';
@@ -133,7 +133,7 @@ export const createDownloadJob = async (
                     const spec = {
                         source,
                         id: String(track.id),
-                        quality: eff.outputQuality,
+                        quality: '27' as const, // always the platform's maximum tier
                         title: formatTitle(track),
                         artist: formatArtists(track),
                         album: formatTitle(album ?? track),
@@ -151,7 +151,7 @@ export const createDownloadJob = async (
                         applyMeta: settings.applyMetadata,
                         codec: eff.outputCodec,
                         bitrate: eff.bitrate,
-                        tokens: getServiceTokens(),
+                        tokens: {}, // credentials live in the server-side pool now
                         country,
                         duration: track.duration
                     };
@@ -218,11 +218,11 @@ export const createDownloadJob = async (
                         {
                             albumId: String((result as QobuzAlbum).id),
                             source,
-                            quality: eff.outputQuality,
+                            quality: '27',
                             codec: eff.outputCodec,
                             bitrate: eff.bitrate,
                             applyMeta: settings.applyMetadata,
-                            tokens: getServiceTokens(),
+                            tokens: {},
                             country,
                             zipName: formattedZipTitle,
                             trackNamePattern: settings.trackName

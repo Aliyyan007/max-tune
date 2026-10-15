@@ -61,9 +61,11 @@ export async function GET(request: NextRequest) {
                         controller.enqueue(chunk as Uint8Array);
                     }
                     controller.close();
+                    setProgress(id, { stage: 'done' });
                     console.log(`[download-file ${id.slice(0, 8)}] response finished — ${relayed}B relayed`);
                 } catch (e: any) {
                     console.log(`[download-file ${id.slice(0, 8)}] response broke after ${relayed}B: ${e?.message}`);
+                    setProgress(id, { stage: 'error', error: e?.message ?? 'stream failed' });
                     controller.error(e);
                 }
             }

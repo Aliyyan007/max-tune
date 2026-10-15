@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { pickToken, reportToken, tokensFor } from '@/lib/token-pool';
 import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, QualityId, RequestContext } from './types';
 import type { FetchedQobuzAlbum, QobuzAlbum, QobuzTrack } from '@/lib/qobuz-dl';
@@ -103,15 +104,17 @@ function normArtist(a: any) {
 const badTokens = new Set<string>();
 
 function headers(ctx: RequestContext): Record<string, string> {
-    const token = ctx.tokens.tidalToken || process.env.TIDAL_ACCESS_TOKEN;
+    const token = pickToken('tidal') || ctx.tokens.tidalToken || process.env.TIDAL_ACCESS_TOKEN;
     if (token && !badTokens.has(token)) return { authorization: `Bearer ${token}`, 'User-Agent': UA };
     return { 'x-tidal-token': ANON_CLIENT_ID, 'User-Agent': UA };
 }
 
 export async function getTidalSession(ctx: RequestContext): Promise<{ countryCode: string; userId: number }> {
-    // Try the user-supplied token first, then the env token — a stale Settings
-    // token shouldn't mask a working env token (they can differ on hosted deploys).
-    const candidates = [ctx.tokens.tidalToken, process.env.TIDAL_ACCESS_TOKEN].filter((t, i, a) => t && a.indexOf(t) === i) as string[];
+    // Round-robin through the server pool first, then any caller-supplied/env
+    // token — a stale token shouldn't mask healthy ones behind it.
+    const candidates = [pickToken('tidal'), ...tokensFor('tidal', 'TIDAL_ACCESS_TOKEN'), ctx.tokens.tidalToken].filter(
+        (t, i, a): t is string => !!t && a.indexOf(t) === i
+    );
     if (!candidates.length) throw new Error('Tidal requires your access token — add it in Settings → Service Tokens (or TIDAL_ACCESS_TOKEN env)');
     let expired = false;
     for (const token of candidates) {
@@ -123,10 +126,12 @@ export async function getTidalSession(ctx: RequestContext): Promise<{ countryCod
             const session = { countryCode: res.data.countryCode ?? 'US', userId: res.data.userId, at: Date.now() };
             sessionCache.set(token, session);
             ctx.tokens.tidalToken = token; // pin the working token for this request
+            reportToken('tidal', token, true);
             return session;
         } catch (e: any) {
             if (e?.response?.status === 401 || /expired/i.test(e?.response?.data?.userMessage ?? '')) {
                 badTokens.add(token);
+                reportToken('tidal', token, false, 'token expired/invalid');
                 expired = true;
                 continue;
             }

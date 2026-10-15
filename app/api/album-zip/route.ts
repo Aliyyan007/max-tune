@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import axios from 'axios';
 import crypto from 'crypto';
 import { Zip, AsyncZipDeflate } from 'fflate';
 import { adapters, apiError } from '@/lib/platforms';
@@ -69,7 +70,10 @@ export async function GET(request: NextRequest) {
                     if (err) zipErr = err;
                     else {
                         if (chunk.length) controller.enqueue(chunk);
-                        if (final) controller.close();
+                        if (final) {
+                            controller.close();
+                            setProgress(id, { stage: 'done' }); // archive fully flushed to the client
+                        }
                     }
                 });
                 try {
@@ -77,8 +81,7 @@ export async function GET(request: NextRequest) {
                     const artUrl = normalizeArtUrl(album.image?.large);
                     if (artUrl && spec.applyMeta !== false) {
                         try {
-                            const art = (await import('axios')).default;
-                            const artRes = await art.get(artUrl, { responseType: 'arraybuffer', timeout: 30000 });
+                            const artRes = await axios.get(artUrl, { responseType: 'arraybuffer', timeout: 30000 });
                             const entry = new AsyncZipDeflate('cover.jpg', { level: 0 });
                             zip.add(entry);
                             entry.push(new Uint8Array(artRes.data), true);
@@ -117,7 +120,6 @@ export async function GET(request: NextRequest) {
                         setProgress(id, { sent: index + 1 });
                     }
                     zip.end();
-                    setProgress(id, { stage: 'done' });
                 } catch (e: any) {
                     setProgress(id, { stage: 'error', error: e?.message ?? 'zip failed' });
                     try {

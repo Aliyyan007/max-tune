@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { pickToken } from '@/lib/token-pool';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -203,9 +204,9 @@ async function appleStorefront(mediaToken: string): Promise<string> {
 // Apple Music via amdl.exe — needs a running wrapper-lite service (user supplies Apple native
 // libraries) plus the account's media-user-token. Produces ALAC/AAC from Apple's own CDN.
 export async function downloadAppleNative(adamId: string, quality: 'alac-hi' | 'alac' | 'aac', tokens: { appleMediaToken?: string; appleWrapper?: string }): Promise<NativeResult> {
-    const mediaToken = tokens.appleMediaToken || process.env.APPLE_MEDIA_USER_TOKEN;
+    const mediaToken = pickToken('apple') || tokens.appleMediaToken || process.env.APPLE_MEDIA_USER_TOKEN;
     const wrapperUrl = tokens.appleWrapper || process.env.APPLE_WRAPPER_URL || 'http://127.0.0.1:12340';
-    if (!mediaToken) throw new Error('Apple Music requires your media-user-token — add it in Settings → Service Tokens');
+    if (!mediaToken) throw new Error('Apple Music requires a media-user-token — configure one in the admin panel');
     const amdl = path.join(process.cwd(), 'bin', 'amdl.exe');
     if (!fs.existsSync(amdl)) throw new Error('bin/amdl.exe missing');
     // fail fast if wrapper-lite isn't reachable — amdl would otherwise stall on a dead endpoint
@@ -399,7 +400,7 @@ export type AmazonQuality = 'Max' | 'Master' | 'High' | 'Normal' | 'Medium' | 'L
 // Resolve the chosen stream + its Widevine key — fails fast on ineligible accounts
 // before any bytes move. Exported for the streaming download path.
 export async function resolveAmazonStream(asin: string, quality: AmazonQuality, tokens: { amazonToken?: string }) {
-    const token = tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN;
+    const token = pickToken('amazon') || tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN;
     if (!token) throw new Error('Amazon Music needs an account token — get one at amz.dezalty.com, then paste it in Settings → Service Tokens');
     const q = quality === 'Master' ? 'Max' : quality;
     const raw = await gwFetch<AmazonStream[] | { streams?: AmazonStream[] }>(`/tracks/${encodeURIComponent(asin)}/streams/${encodeURIComponent(q)}`, token);
