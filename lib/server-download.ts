@@ -494,11 +494,10 @@ async function produceTrackStream(spec: DownloadSpec): Promise<Upstream | null> 
                 };
                 proc.stderr.on('data', (d) => {
                     lastErr += d.toString();
-                    // spotify-native.py prints the result JSON on stderr in '-' mode — a good sign
-                    if (lastErr.includes('"file"')) done(true);
+                    if (lastErr.includes('"file"')) done(true); // result JSON on stderr = clean exit
                 });
-                // 'readable' fires on first buffered bytes WITHOUT consuming them
-                proc.stdout.once('readable', () => done(true));
+                // 'readable' also fires at EOF — require real buffered bytes, not just the event
+                proc.stdout.once('readable', () => done(proc.stdout.readableLength > 0));
                 proc.on('close', () => done(false));
                 proc.on('error', () => done(false));
             });
