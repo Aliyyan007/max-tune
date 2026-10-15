@@ -2,6 +2,8 @@
 
 import axios from 'axios';
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+
+const APP_NAME = process.env.NEXT_PUBLIC_APPLICATION_NAME || 'max-tune';
 import ReleaseCard from '@/components/release-card';
 import SearchBar from '@/components/search-bar/search-bar';
 import { Button } from '@/components/ui/button';
@@ -51,7 +53,7 @@ const SearchView = () => {
     const { platform } = usePlatform();
 
     useEffect(() => {
-        console.log(`%c${process.env.NEXT_PUBLIC_APPLICATION_NAME}`, 'font-size: 25px; font-weight: bold;');
+        console.log(`%c${APP_NAME}`, 'font-size: 25px; font-weight: bold;');
         if (process.env.NEXT_PUBLIC_DISCORD) {
             console.log(`Discord: ${process.env.NEXT_PUBLIC_DISCORD}`);
         }
@@ -279,17 +281,17 @@ const SearchView = () => {
                     animate={logoAnimationControls}
                     transition={{ duration: 0.5 }}
                 >
-                    {process.env.NEXT_PUBLIC_APPLICATION_NAME!.toLowerCase() === 'qobuz-dl' ? (
+                    {APP_NAME.toLowerCase() === 'qobuz-dl' ? (
                         <>
                             {mounted && logoSrc ? (
-                                <img src={logoSrc} alt={process.env.NEXT_PUBLIC_APPLICATION_NAME!} className='w-auto h-[100px] mx-auto z-[5]' />
+                                <img src={logoSrc} alt={APP_NAME} className='w-auto h-[100px] mx-auto z-[5]' />
                             ) : (
                                 <div className='min-h-[100px] min-w-[10px]' />
                             )}
                         </>
                     ) : (
                         <>
-                            <h1 className='text-4xl font-bold text-center'>{process.env.NEXT_PUBLIC_APPLICATION_NAME}</h1>
+                            <h1 className='text-4xl font-bold text-center'>{APP_NAME}</h1>
                             <p className='text-md text-center font-medium text-muted-foreground'>The simplest music downloader</p>
                         </>
                     )}

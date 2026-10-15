@@ -22,21 +22,23 @@ const inter = Inter({
     display: 'swap'
 });
 
+const APP_NAME = process.env.NEXT_PUBLIC_APPLICATION_NAME || 'max-tune';
+
 export const metadata: Metadata = {
     metadataBase: new URL('https://www.qobuz-dl.com/'), // Site URL
     title: {
-        default: process.env.NEXT_PUBLIC_APPLICATION_NAME + ' - A frontend browser client for downloading music for Qobuz.',
-        template: process.env.NEXT_PUBLIC_APPLICATION_NAME!
+        default: APP_NAME + ' - A frontend browser client for downloading music for Qobuz.',
+        template: APP_NAME
     },
     description: 'A frontend browser client for downloading music for Qobuz.',
     openGraph: {
         images:
-            process.env.NEXT_PUBLIC_APPLICATION_NAME!.toLowerCase() === 'qobuz-dl'
+            APP_NAME.toLowerCase() === 'qobuz-dl'
                 ? [{ url: '/logo/qobuz-banner.png', width: 650, height: 195, alt: 'Qobuz Logo' }]
                 : []
     },
     keywords: [
-        `${process.env.NEXT_PUBLIC_APPLICATION_NAME!}`,
+        `${APP_NAME}`,
         'music',
         'downloader',
         'hi-res',

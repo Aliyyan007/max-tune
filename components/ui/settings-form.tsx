@@ -1,5 +1,7 @@
 'use client';
 import React, { useEffect, useRef, useState } from 'react';
+
+const APP_NAME = process.env.NEXT_PUBLIC_APPLICATION_NAME || 'max-tune';
 import { Button } from './button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { ChevronDownIcon, DotIcon, InfoIcon, SettingsIcon } from 'lucide-react';
@@ -85,7 +87,7 @@ const SettingsForm = () => {
                     <SheetHeader>
                         <div className='flex flex-col my-1'>
                             <SheetTitle>Theme</SheetTitle>
-                            <SheetDescription>Change the way {process.env.NEXT_PUBLIC_APPLICATION_NAME} looks</SheetDescription>
+                            <SheetDescription>Change the way {APP_NAME} looks</SheetDescription>
                         </div>
                         <ModeToggle />
                     </SheetHeader>
@@ -93,7 +95,7 @@ const SettingsForm = () => {
                     <SheetHeader>
                         <div className='flex flex-col my-1'>
                             <SheetTitle>Background</SheetTitle>
-                            <SheetDescription>Change the background of {process.env.NEXT_PUBLIC_APPLICATION_NAME}</SheetDescription>
+                            <SheetDescription>Change the background of {APP_NAME}</SheetDescription>
                         </div>
                         <DropdownMenu>
                             <DropdownMenuTrigger asChild>
