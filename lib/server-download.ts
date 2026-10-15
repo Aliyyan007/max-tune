@@ -231,10 +231,40 @@ function runFfmpeg(args: string[], timeoutMs = 300000): Promise<void> {
     });
 }
 
+// Probe a buffered file's real audio codec via ffmpeg -i (manifests lie —
+// Tidal serves FLAC inside fMP4 declared as audio/mp4, which breaks remuxing).
+function probeAudioCodec(file: string): Promise<string> {
+    return new Promise((resolve) => {
+        const p = spawn(ffmpegBin(), ['-hide_banner', '-i', file], { windowsHide: true });
+        let err = '';
+        p.stderr.on('data', (d) => (err += d.toString()));
+        p.on('close', () => resolve(err.match(/Audio:\s*([a-zA-Z0-9_]+)/)?.[1]?.toLowerCase() ?? ''));
+        setTimeout(() => {
+            try {
+                p.kill('SIGKILL');
+            } catch {}
+            resolve('');
+        }, 15000);
+    });
+}
+
 // Apply FFMETADATA tags + cover art + optional transcode — server-side port of applyMetadata
 export async function tagAndEncode(input: Buffer, inputFormat: string, spec: DownloadSpec): Promise<{ data: Buffer; ext: string }> {
-    const inExt = EXT_OF_FORMAT[inputFormat] ?? 'flac';
+    let inExt = EXT_OF_FORMAT[inputFormat] ?? 'flac';
     const sourceMode = spec.codec === 'SOURCE';
+    // mp4-family containers can secretly carry FLAC — remux to .flac, not .m4a
+    if (sourceMode && ['m4a', 'mp4'].includes(inExt)) {
+        const probeFile = path.join(os.tmpdir(), `probe-${Date.now()}.${inExt}`);
+        try {
+            fs.writeFileSync(probeFile, input);
+            if ((await probeAudioCodec(probeFile)) === 'flac') inExt = 'flac';
+        } catch {
+        } finally {
+            try {
+                fs.rmSync(probeFile, { force: true });
+            } catch {}
+        }
+    }
     const outExt = sourceMode ? inExt : (CODEC[spec.codec]?.ext ?? inExt);
     const skipRecode =
         sourceMode ||

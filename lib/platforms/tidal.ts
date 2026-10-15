@@ -155,12 +155,19 @@ export async function resolveTidalTrack(trackId: string, quality: QualityId, ctx
                 if (m.encryptionType && m.encryptionType !== 'NONE') continue;
                 const url = m.urls?.[0];
                 if (!url) continue;
-                const isFlac = (m.mimeType ?? '').includes('flac');
+                // mimeType says 'audio/mp4' even when the codec is FLAC inside
+                // the container — trust the codecs field for the real format.
+                const codecs = m.codecs ?? m.mimeType ?? '';
+                const isFlac = /flac/i.test(codecs);
                 return { url, format: (isFlac ? 'flac' : 'm4a') as 'flac' | 'm4a', direct: true };
             }
             if (info.manifestMimeType === 'application/dash+xml') {
-                // hi-res arrives as fMP4 DASH — handled in the stream route
-                return { dashManifest: raw, format: 'mp4' as const, direct: false };
+                // fMP4 DASH container — but the codec may be FLAC (ffmpeg can't
+                // remux that into mp4/ipod). Report the real codec as the format
+                // so downstream picks .flac; demuxing fMP4→flac just works.
+                const codec = raw.match(/codecs="([^"]+)"/)?.[1] ?? '';
+                const fmt = /flac/i.test(codec) ? ('flac' as const) : ('mp4' as const);
+                return { dashManifest: raw, format: fmt, direct: false };
             }
         } catch (e) {
             lastErr = e;
