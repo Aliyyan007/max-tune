@@ -68,6 +68,23 @@ export function normalizeArtUrl(url?: string): string | undefined {
     return url;
 }
 
+// Vorbis-family containers (ogg/opus) can't carry a picture *stream* — ffmpeg's
+// ogg muxer rejects it ('Unsupported codec id in stream 1'). The standard is a
+// base64 FLAC picture block in a METADATA_BLOCK_PICTURE comment.
+export function flacPictureBlock(art: Buffer, mime = 'image/jpeg'): string {
+    const m = Buffer.from(mime);
+    const buf = Buffer.alloc(8 + 4 + m.length + 4 + 16 + 4 + art.length);
+    let o = 0;
+    buf.writeUInt32BE(3, o); o += 4; // type 3 = front cover
+    buf.writeUInt32BE(m.length, o); o += 4;
+    m.copy(buf, o); o += m.length;
+    buf.writeUInt32BE(0, o); o += 4; // desc len
+    for (let i = 0; i < 4; i++) { buf.writeUInt32BE(0, o); o += 4; } // w/h/depth/colors (0 = unknown)
+    buf.writeUInt32BE(art.length, o); o += 4;
+    art.copy(buf, o);
+    return buf.toString('base64');
+}
+
 // Escape for FFMETADATA1 format (\ = ; # and newlines are reserved)
 const metaEsc = (s: string) => s.replace(/\\/g, '\\\\').replace(/\n/g, ' ').replace(/([=;#])/g, '\\$1');
 
@@ -243,6 +260,17 @@ export async function tagAndEncode(input: Buffer, inputFormat: string, spec: Dow
             cur = enc;
         }
 
+        // Fetch art first: for ogg/opus it lands in the FFMETADATA file as a
+        // METADATA_BLOCK_PICTURE comment (the base64 block is far over the OS
+        // arg limit, so it can't be a -metadata arg).
+        const vorbisArt = ['ogg', 'opus'].includes(outExt);
+        let artBuf: Buffer | null = null;
+        if (doTags && spec.artUrl && !['wav', 'webm'].includes(outExt)) {
+            try {
+                artBuf = await fetchBuf(normalizeArtUrl(spec.artUrl)!, { 'User-Agent': 'Mozilla/5.0' });
+            } catch {}
+        }
+
         if (doTags) {
             const artists = spec.artist || 'Various Artists';
             let meta = ';FFMETADATA1';
@@ -259,6 +287,7 @@ export async function tagAndEncode(input: Buffer, inputFormat: string, spec: Dow
             if (spec.upc) meta += `\nbarcode=${metaEsc(spec.upc)}`;
             if (spec.trackNum) meta += `\ntrack=${spec.totalTracks ? `${spec.trackNum}/${spec.totalTracks}` : spec.trackNum}`;
             if (spec.discNum) meta += `\ndisc=${spec.discNum}`;
+            if (artBuf && vorbisArt) meta += `\nMETADATA_BLOCK_PICTURE=${metaEsc(flacPictureBlock(artBuf))}`;
             const metaFile = path.join(dir, 'meta.txt');
             fs.writeFileSync(metaFile, meta, 'utf-8');
             const tagged = path.join(dir, `tagged.${outExt}`);
@@ -266,12 +295,11 @@ export async function tagAndEncode(input: Buffer, inputFormat: string, spec: Dow
             cur = tagged;
         }
 
-        // cover art embed — not for wav/ogg-family containers
-        if (doTags && spec.artUrl && !['wav', 'webm'].includes(outExt)) {
+        // cover art embed — stream-based for containers that carry pictures
+        if (artBuf && !vorbisArt) {
             try {
-                const art = await fetchBuf(normalizeArtUrl(spec.artUrl)!, { 'User-Agent': 'Mozilla/5.0' });
                 const artFile = path.join(dir, 'art.jpg');
-                fs.writeFileSync(artFile, art);
+                fs.writeFileSync(artFile, artBuf);
                 const fin = path.join(dir, `out.${outExt}`);
                 await runFfmpeg(['-y', '-i', cur, '-i', artFile, '-c', 'copy', '-map', '0', '-map', '1', '-disposition:v:0', 'attached_pic', fin]);
                 cur = fin;
@@ -566,6 +594,17 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string): Pro
         if (up.decryptKey) args.push('-decryption_key', up.decryptKey);
         args.push('-i', 'pipe:0');
 
+        // Fetch art before building inputs: vorbis-family output embeds it as a
+        // METADATA_BLOCK_PICTURE line inside the FFMETADATA file (a CLI arg would
+        // blow the OS arg-length limit — the base64 block is ~400KB).
+        let artBuf: Buffer | null = null;
+        if (doTags && spec.artUrl && !['wav', 'webm'].includes(outExt)) {
+            try {
+                artBuf = await fetchBuf(normalizeArtUrl(spec.artUrl)!, { 'User-Agent': 'Mozilla/5.0' });
+            } catch {}
+        }
+        const vorbisArt = ['ogg', 'opus'].includes(outExt);
+
         let inputIdx = 1;
         let metaInput = -1;
         if (doTags) {
@@ -584,6 +623,7 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string): Pro
             if (spec.upc) meta += `\nbarcode=${metaEsc(spec.upc)}`;
             if (spec.trackNum) meta += `\ntrack=${spec.totalTracks ? `${spec.trackNum}/${spec.totalTracks}` : spec.trackNum}`;
             if (spec.discNum) meta += `\ndisc=${spec.discNum}`;
+            if (artBuf && vorbisArt) meta += `\nMETADATA_BLOCK_PICTURE=${metaEsc(flacPictureBlock(artBuf))}`;
             const metaFile = path.join(dir, 'meta.txt');
             fs.writeFileSync(metaFile, meta, 'utf-8');
             args.push('-i', metaFile);
@@ -592,13 +632,10 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string): Pro
 
         const artFile = path.join(dir, 'art.jpg');
         let artInput = -1;
-        if (doTags && spec.artUrl && !['wav', 'webm'].includes(outExt)) {
-            try {
-                const art = await fetchBuf(normalizeArtUrl(spec.artUrl)!, { 'User-Agent': 'Mozilla/5.0' });
-                fs.writeFileSync(artFile, art);
-                args.push('-i', artFile);
-                artInput = inputIdx++;
-            } catch {}
+        if (artBuf && !vorbisArt) {
+            fs.writeFileSync(artFile, artBuf);
+            args.push('-i', artFile);
+            artInput = inputIdx++;
         }
 
         if (metaInput >= 0) args.push('-map_metadata', String(metaInput));
