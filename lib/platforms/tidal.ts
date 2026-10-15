@@ -109,22 +109,32 @@ function headers(ctx: RequestContext): Record<string, string> {
 }
 
 export async function getTidalSession(ctx: RequestContext): Promise<{ countryCode: string; userId: number }> {
-    const token = ctx.tokens.tidalToken || process.env.TIDAL_ACCESS_TOKEN;
-    if (!token) throw new Error('Tidal requires your access token — add it in Settings → Service Tokens (or TIDAL_ACCESS_TOKEN env)');
-    const cached = sessionCache.get(token);
-    if (cached && Date.now() - cached.at < 60 * 60 * 1000) return cached;
-    try {
-        const res = await axios.get(`${BASE}/sessions`, { headers: headers(ctx), timeout: 15000 });
-        const session = { countryCode: res.data.countryCode ?? 'US', userId: res.data.userId, at: Date.now() };
-        sessionCache.set(token, session);
-        return session;
-    } catch (e: any) {
-        if (e?.response?.status === 401 || /expired/i.test(e?.response?.data?.userMessage ?? '')) {
-            badTokens.add(token);
-            throw new Error('Tidal token expired — grab a fresh one from listen.tidal.com DevTools, or remove it to browse anonymously');
+    // Try the user-supplied token first, then the env token — a stale Settings
+    // token shouldn't mask a working env token (they can differ on hosted deploys).
+    const candidates = [ctx.tokens.tidalToken, process.env.TIDAL_ACCESS_TOKEN].filter((t, i, a) => t && a.indexOf(t) === i) as string[];
+    if (!candidates.length) throw new Error('Tidal requires your access token — add it in Settings → Service Tokens (or TIDAL_ACCESS_TOKEN env)');
+    let expired = false;
+    for (const token of candidates) {
+        if (badTokens.has(token)) continue;
+        const cached = sessionCache.get(token);
+        if (cached && Date.now() - cached.at < 60 * 60 * 1000) return cached;
+        try {
+            const res = await axios.get(`${BASE}/sessions`, { headers: { authorization: `Bearer ${token}`, 'User-Agent': UA }, timeout: 15000 });
+            const session = { countryCode: res.data.countryCode ?? 'US', userId: res.data.userId, at: Date.now() };
+            sessionCache.set(token, session);
+            ctx.tokens.tidalToken = token; // pin the working token for this request
+            return session;
+        } catch (e: any) {
+            if (e?.response?.status === 401 || /expired/i.test(e?.response?.data?.userMessage ?? '')) {
+                badTokens.add(token);
+                expired = true;
+                continue;
+            }
+            throw e;
         }
-        throw e;
     }
+    if (expired) throw new Error('Tidal token expired — grab a fresh one from listen.tidal.com DevTools, or remove it to browse anonymously');
+    throw new Error('Tidal returned no usable session');
 }
 
 export async function resolveTidalTrack(trackId: string, quality: QualityId, ctx: RequestContext) {
