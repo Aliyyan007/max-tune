@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { Readable } from 'stream';
 import { apiError } from '@/lib/platforms';
 import { createJob, takeJob, streamTaggedTrack, setProgress, type DownloadSpec } from '@/lib/server-download';
 
@@ -51,14 +50,31 @@ export async function GET(request: NextRequest) {
         };
         if (contentLength) headers['Content-Length'] = String(contentLength);
 
-        const web = Readable.toWeb(body) as ReadableStream<Uint8Array>;
-        // abort → kill the producer so no orphan ffmpeg/python lingers
+        // Instrumented relay — count what actually reaches the response body so
+        // Render logs show exactly where a transfer stalls or dies.
+        let relayed = 0;
+        const tee = new ReadableStream<Uint8Array>({
+            async start(controller) {
+                try {
+                    for await (const chunk of body as any) {
+                        relayed += (chunk as Buffer).length;
+                        controller.enqueue(chunk as Uint8Array);
+                    }
+                    controller.close();
+                    console.log(`[download-file ${id.slice(0, 8)}] response finished — ${relayed}B relayed`);
+                } catch (e: any) {
+                    console.log(`[download-file ${id.slice(0, 8)}] response broke after ${relayed}B: ${e?.message}`);
+                    controller.error(e);
+                }
+            }
+        });
         request.signal.addEventListener('abort', () => {
+            console.log(`[download-file ${id.slice(0, 8)}] client aborted after ${relayed}B`);
             try {
                 cleanup?.();
             } catch {}
         });
-        return new NextResponse(web, { headers });
+        return new NextResponse(tee, { headers });
     } catch (e: any) {
         const jid = new URL(request.url).searchParams.get('job') ?? '';
         if (jid) setProgress(jid, { stage: 'error', error: e?.message ?? 'download failed' });
