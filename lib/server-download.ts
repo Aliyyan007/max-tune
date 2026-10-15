@@ -12,7 +12,7 @@ import ffmpegPath from 'ffmpeg-static';
 import { adapters } from './platforms';
 import { resolveDeezerTrack, decryptDeezerFile, blowfishKey } from './platforms/deezer';
 import { resolveTidalTrack } from './platforms/tidal';
-import { downloadSpotifyNative, downloadAppleNative, downloadAmazonNative, resolveAmazonStream, PY_ENV, PY_BIN, withLibrespotLock } from './platforms/native-tools';
+import { downloadSpotifyNative, downloadAppleNative, downloadAmazonNative, resolveAmazonStream, PY_ENV, PY_BIN, withLibrespotLock, materializeSessions } from './platforms/native-tools';
 import { Blowfish } from 'egoroof-blowfish';
 import type { PlatformSource, RequestContext } from './platforms/types';
 
@@ -474,6 +474,7 @@ async function produceTrackStream(spec: DownloadSpec): Promise<Upstream | null> 
 
     if (source === 'spotify' || source === 'spotify-native') {
         // stream via spotify-native.py '-' — real bytes flow as librespot fetches them
+        materializeSessions();
         const credDir = path.join(process.cwd(), 'data');
         const creds = fs.readdirSync(credDir).filter((f) => f === 'credentials.json' || /^spotify-(?!oauth-|pkce-).*\.json$/.test(f));
         if (!creds.length) throw new Error('Spotify account not connected');

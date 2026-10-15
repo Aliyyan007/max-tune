@@ -69,6 +69,7 @@ export function hasSpotifyNativeCreds(): boolean {
 
 // Most recent stored credentials file: our data/ dir, then zotify's default location
 function spotifyCredFile(): string | null {
+    materializeSessions();
     const dirs = [path.join(process.cwd(), 'data'), path.join(process.env.APPDATA ?? '', 'Zotify')];
     const found: string[] = [];
     for (const dir of dirs) {
@@ -90,6 +91,25 @@ export const PY_ENV = { PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: 'python' };
 // Docker images install the tools into their own venv (dependency conflicts) —
 // NATIVE_PYTHON points at it; falls back to system python.
 export const PY_BIN = process.env.NATIVE_PYTHON || 'python';
+
+// data/ is gitignored/dockerignored — hosted deployments ship credentials as env
+// vars instead. Materialize them into data/ once so every tool sees real files.
+let sessionsMaterialized = false;
+export function materializeSessions() {
+    if (sessionsMaterialized) return;
+    sessionsMaterialized = true;
+    const dir = path.join(process.cwd(), 'data');
+    const write = (name: string, content: string | undefined, b64 = false) => {
+        if (!content) return;
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, name), b64 ? Buffer.from(content, 'base64') : content);
+        } catch {}
+    };
+    write('spotify-env-session.json', process.env.SPOTIFY_SESSION_JSON);
+    write('amazon-session.json', process.env.AMAZON_SESSION_JSON);
+    write('amazon-device.wvd', process.env.AMAZON_DEVICE_WVD_B64, true);
+}
 
 // Serialize every librespot-session spawn — Spotify's AP drops concurrent sessions on
 // the same account (RemoteDisconnected), so parallel python calls kill each other.

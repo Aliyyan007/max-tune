@@ -60,8 +60,10 @@ function storeToken(token: string) {
 export async function refreshAmazonToken(): Promise<string | null> {
     refreshing ??= (async () => {
         try {
-            if (!fs.existsSync(SESSION_FILE)) return null;
-            const session = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
+            // env first (hosted deploys ship the session as AMAZON_SESSION_JSON), then the file
+            const raw = process.env.AMAZON_SESSION_JSON || (fs.existsSync(SESSION_FILE) ? fs.readFileSync(SESSION_FILE, 'utf-8') : null);
+            if (!raw) return null;
+            const session = JSON.parse(raw);
             const cookies = session.website_cookies;
             if (!cookies || typeof cookies !== 'object') return null;
             const res = await axios.post(
