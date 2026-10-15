@@ -30,7 +30,7 @@ RUN apk add --no-cache python3 py3-pip ffmpeg libogg libvorbis opus opusfile \
     && /opt/py/bin/pip install --no-cache-dir --no-deps librespot==0.0.10 \
     && /opt/py/bin/pip install --no-cache-dir \
         "requests>=2.32" "websocket-client>=1.8" "zeroconf>=0.146" \
-        "PyOgg==0.6.14a1" "PyYAML<7,>=6.0.3" "Unidecode>=1.3.7"
+        "PyOgg==0.6.14a1" "PyYAML<7,>=6.0.3" "Unidecode>=1.3.7" pycryptodomex defusedxml
 
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
