@@ -22,8 +22,11 @@ QUALITY_MAP = {
 }
 
 
+_STREAM_MODE = False  # set once args are parsed; stdout carries audio then
+
+
 def fail(msg):
-    print(json.dumps({'error': msg}))
+    print(json.dumps({'error': msg}), file=sys.stderr if _STREAM_MODE else sys.stdout)
     sys.exit(1)
 
 
@@ -54,6 +57,8 @@ def main():
     ap.add_argument('--username')
     ap.add_argument('--password')
     args = ap.parse_args()
+    global _STREAM_MODE
+    _STREAM_MODE = args.output == '-'
 
     session = build_session(args)
 
