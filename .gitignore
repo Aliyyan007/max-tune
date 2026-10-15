@@ -50,3 +50,5 @@ credentials.json
 *.wvd
 *-session.json
 spotify-*.json
+
+*.log
