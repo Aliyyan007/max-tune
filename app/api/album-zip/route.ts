@@ -66,14 +66,27 @@ export async function GET(request: NextRequest) {
         const stream = new ReadableStream<Uint8Array>({
             async start(controller) {
                 let zipErr: any = null;
+                let dead = false; // once errored/closed, fflate workers keep calling us — ignore them
                 const zip = new Zip((err, chunk, final) => {
-                    if (err) zipErr = err;
-                    else {
+                    if (dead) return;
+                    if (err) {
+                        dead = true;
+                        zipErr = err;
+                        try {
+                            controller.error(err);
+                        } catch {}
+                        return;
+                    }
+                    try {
                         if (chunk.length) controller.enqueue(chunk);
                         if (final) {
                             controller.close();
+                            dead = true;
                             setProgress(id, { stage: 'done' }); // archive fully flushed to the client
                         }
+                    } catch {
+                        dead = true;
+                        zipErr ??= new Error('response stream closed');
                     }
                 });
                 try {
@@ -121,9 +134,13 @@ export async function GET(request: NextRequest) {
                     }
                     zip.end();
                 } catch (e: any) {
-                    setProgress(id, { stage: 'error', error: e?.message ?? 'zip failed' });
+                    if (!dead) setProgress(id, { stage: 'error', error: e?.message ?? 'zip failed' });
+                    dead = true;
                     try {
                         controller.error(e);
+                    } catch {}
+                    try {
+                        (zip as any).terminate?.();
                     } catch {}
                 }
             }

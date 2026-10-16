@@ -53,27 +53,49 @@ export async function GET(request: NextRequest) {
         // Instrumented relay — count what actually reaches the response body so
         // Render logs show exactly where a transfer stalls or dies.
         let relayed = 0;
+        let dead = false; // guard: enqueue/close on an aborted controller throws ERR_INVALID_STATE (uncaught = process crash)
         const tee = new ReadableStream<Uint8Array>({
             async start(controller) {
                 try {
                     for await (const chunk of body as any) {
+                        if (dead) break;
+                        try {
+                            controller.enqueue(chunk as Uint8Array);
+                        } catch {
+                            dead = true;
+                            break;
+                        }
                         relayed += (chunk as Buffer).length;
-                        controller.enqueue(chunk as Uint8Array);
                     }
-                    controller.close();
-                    setProgress(id, { stage: 'done' });
-                    console.log(`[download-file ${id.slice(0, 8)}] response finished — ${relayed}B relayed`);
+                    if (!dead) {
+                        dead = true;
+                        try {
+                            controller.close();
+                        } catch {}
+                        setProgress(id, { stage: 'done' });
+                        console.log(`[download-file ${id.slice(0, 8)}] response finished — ${relayed}B relayed`);
+                    }
                 } catch (e: any) {
                     console.log(`[download-file ${id.slice(0, 8)}] response broke after ${relayed}B: ${e?.message}`);
-                    setProgress(id, { stage: 'error', error: e?.message ?? 'stream failed' });
-                    controller.error(e);
+                    if (!dead) {
+                        dead = true;
+                        setProgress(id, { stage: 'error', error: e?.message ?? 'stream failed' });
+                        try {
+                            controller.error(e);
+                        } catch {}
+                    }
                 }
             }
         });
         request.signal.addEventListener('abort', () => {
             console.log(`[download-file ${id.slice(0, 8)}] client aborted after ${relayed}B`);
+            dead = true;
+            setProgress(id, { stage: 'error', error: 'client disconnected' });
             try {
                 cleanup?.();
+            } catch {}
+            try {
+                (body as any)?.destroy?.();
             } catch {}
         });
         return new NextResponse(tee, { headers });

@@ -113,18 +113,19 @@ const ArtistDialog = ({ open, setOpen, artist }: { open: boolean; setOpen: (open
             <DialogContent className='w-[1000px] max-w-[90%] md:max-w-[80%] overflow-hidden'>
                 <div className='flex gap-3 overflow-hidden'>
                     <div className='relative shrink-0 aspect-square min-w-[100px] min-h-[100px] rounded-sm overflow-hidden'>
-                        {(artist.image?.small || (artistResults?.artist.images?.portrait?.hash && artistResults.artist.images.portrait.hash)) && (
+                        {(artist.image?.small || (artistResults?.artist?.images?.portrait?.hash && artistResults.artist.images.portrait.hash)) && (
                             <Skeleton className='absolute aspect-square w-full h-full' />
                         )}
-                        {artist.image?.small || ((artist as any).source ?? 'qobuz') === 'qobuz' ? (
+                        {artist.image?.small ||
+                        (((artist as any).source ?? 'qobuz') === 'qobuz' && artistResults?.artist?.images?.portrait?.hash) ? (
                             <Image
                                 fill
                                 src={
                                     artist.image?.small ||
                                     'https://static.qobuz.com/images/artists/covers/medium/' +
-                                        artistResults?.artist.images.portrait.hash +
+                                        artistResults?.artist?.images?.portrait?.hash +
                                         '.' +
-                                        artistResults?.artist.images.portrait.format
+                                        artistResults?.artist?.images?.portrait?.format
                                 }
                                 alt={artist.name}
                                 className='text-[0px] absolute aspect-square w-full h-full object-cover'
