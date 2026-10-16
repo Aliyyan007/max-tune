@@ -146,6 +146,7 @@ export const appleAdapter: PlatformAdapter = {
         // iTunes exposes no discography grouping — heuristic: >3 tracks = album, else single/EP
         out.releases.album = { has_more: false, items: items.filter((a: any) => a.tracks_count > 3) };
         out.releases.epSingle = { has_more: false, items: items.filter((a: any) => a.tracks_count <= 3) };
+        out.albums_count = items.length;
         if (topSongs.status === 'fulfilled' && topSongs.value) {
             out.top_tracks = (topSongs.value.data.results ?? [])
                 .filter((r: any) => r.wrapperType === 'track' && (r.artistId === artist?.artistId || (r.artistName ?? '').toLowerCase() === artistName.toLowerCase()))

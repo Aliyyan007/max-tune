@@ -54,22 +54,24 @@ async function api(path: string, params: Record<string, any> = {}, ctx: RequestC
             timeout: 15000
         });
     if (!appToken || appToken.expiresAt <= Date.now()) await getAppToken(ctx);
-    try {
-        return (await req()).data;
-    } catch (e: any) {
-        if (e?.response?.status === 401) {
-            appToken = null;
-            await getAppToken(ctx);
+    for (let attempt = 0; ; attempt++) {
+        try {
             return (await req()).data;
+        } catch (e: any) {
+            if (e?.response?.status === 401 && attempt === 0) {
+                appToken = null;
+                await getAppToken(ctx);
+                continue;
+            }
+            if (e?.response?.status === 403)
+                throw new Error('Spotify dev app forbidden — the app owner needs a Premium account (developer.spotify.com).');
+            if (e?.response?.status === 429 && attempt < 3) {
+                const wait = Math.min(parseInt(e.response.headers?.['retry-after'] ?? '5') || 5, 30);
+                await new Promise((r) => setTimeout(r, wait * 1000));
+                continue;
+            }
+            throw e;
         }
-        if (e?.response?.status === 403)
-            throw new Error('Spotify dev app forbidden — the app owner needs a Premium account (developer.spotify.com). Check Client ID/Secret in Settings.');
-        if (e?.response?.status === 429) {
-            const wait = Math.min(parseInt(e.response.headers?.['retry-after'] ?? '5') || 5, 30);
-            await new Promise((r) => setTimeout(r, wait * 1000));
-            return (await req()).data;
-        }
-        throw e;
     }
 }
 
@@ -293,6 +295,7 @@ const spotifyAdapter: PlatformAdapter = {
         out.releases.album = { has_more: !!relAlbums?.next, items: (relAlbums?.items ?? []).map((x: any) => normAlbum(x, a.genres)) };
         out.releases.epSingle = { has_more: !!relSingles?.next, items: (relSingles?.items ?? []).map((x: any) => normAlbum(x, a.genres)) };
         out.releases.compilation = { has_more: !!relCompilations?.next, items: (relCompilations?.items ?? []).map((x: any) => normAlbum(x, a.genres)) };
+        out.albums_count = (relAlbums?.total ?? 0) + (relSingles?.total ?? 0) + (relCompilations?.total ?? 0);
         return { artist: out };
     },
 

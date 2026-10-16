@@ -138,8 +138,8 @@ export async function getTidalSession(ctx: RequestContext): Promise<{ countryCod
             throw e;
         }
     }
-    if (expired) throw new Error('Tidal token expired — grab a fresh one from listen.tidal.com DevTools, or remove it to browse anonymously');
-    throw new Error('Tidal returned no usable session');
+    if (expired) throw new Error('Tidal token expired — grab a fresh Bearer from listen.tidal.com DevTools → Network → any api.tidal.com request, and add it in the admin panel (double-click the corner dot)');
+    throw new Error('Tidal returned no usable session — add a Bearer token in the admin panel (double-click the corner dot)');
 }
 
 export async function resolveTidalTrack(trackId: string, quality: QualityId, ctx: RequestContext) {
@@ -253,6 +253,7 @@ export const tidalAdapter: PlatformAdapter = {
         out.top_tracks = (top?.data?.items ?? []).map((t: any) => normTrack(t));
         const rel = await axios.get(`${BASE}/artists/${artistId}/albums`, { params: { countryCode: session.countryCode, limit: 100 }, headers: headers(ctx), timeout: 15000 }).catch(() => null);
         out.releases.album = { has_more: (rel?.data?.totalNumberOfItems ?? 0) > (rel?.data?.items?.length ?? 0), items: (rel?.data?.items ?? []).map((x: any) => normAlbum(x)) };
+        out.albums_count = rel?.data?.totalNumberOfItems ?? 0;
         return { artist: out };
     },
 

@@ -337,6 +337,7 @@ export const deezerAdapter: PlatformAdapter = {
         const out = emptyArtistResults();
         out.id = a.id;
         out.name = { display: a.name };
+        out.albums_count = a.nb_album ?? 0;
         out.image = a.picture_medium ? { small: proxiedImg(a.picture_medium) } : null;
         const top = await axios.get(`${PUBLIC_API}/artist/${artistId}/top`, { params: { limit: 50 }, timeout: 15000 }).catch(() => null);
         out.top_tracks = (top?.data?.data ?? []).map((t: any) => normTrack(t));
