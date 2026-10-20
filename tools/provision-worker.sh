@@ -13,7 +13,7 @@ fi
 
 if command -v python3 >/dev/null 2>&1; then
   echo "[provision] python3 present — installing librespot + pywidevine"
-  (pip install --quiet librespot pywidevine requests || pip3 install --quiet librespot pywidevine requests || true) && echo "[provision] python deps ok" || echo "[provision] python deps failed — spotify/amazon jobs will surface errors"
+  (pip install --quiet "librespot==0.0.10" pywidevine requests || pip3 install --quiet "librespot==0.0.10" pywidevine requests || true) && echo "[provision] python deps ok" || echo "[provision] python deps failed — spotify/amazon jobs will surface errors"
 else
   echo "[provision] no python3 — spotify/amazon jobs will surface errors"
 fi

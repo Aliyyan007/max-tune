@@ -37,7 +37,9 @@ def build_session(args):
     builder = librespot.core.Session.Builder()
     if os.path.isfile(args.creds):
         obj = json.load(open(args.creds))
-        builder.stored(base64.b64encode(json.dumps(obj).encode('ascii')))
+        # stored() wants the base64 credential as str across librespot versions —
+        # b64encode returns bytes, which some releases reject with TypeError.
+        builder.stored(base64.b64encode(json.dumps(obj).encode('ascii')).decode('ascii'))
     elif args.username and args.password:
         builder.user_pass(args.username, args.password)
     else:

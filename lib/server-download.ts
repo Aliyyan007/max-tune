@@ -229,6 +229,11 @@ export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buf
 
     if (source === 'qobuz') {
         const info = await getDownloadInfo(Number(id), quality as any, ctx);
+        if (!/^https?:\/\//.test(String(info.url ?? ''))) {
+            // Some restriction variants return a non-absolute/odd url field —
+            // name it instead of surfacing axios's bare "Invalid URL".
+            throw new Error(`Qobuz returned an unusable stream URL (${String(info.url).slice(0, 80)})`);
+        }
         const data = await fetchBuf(info.url, { 'User-Agent': 'Mozilla/5.0' });
         const mime = String(info.mime_type ?? '');
         const out = { data, format: mime.includes('flac') ? 'flac' : mime.includes('mpeg') ? 'mp3' : mime.includes('mp4') ? 'm4a' : 'flac' };
