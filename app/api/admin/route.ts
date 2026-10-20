@@ -40,6 +40,18 @@ export async function POST(request: NextRequest) {
                 if (!key || value === undefined) throw new Error('key + value required');
                 data = admin.setSetting(String(key), String(value));
                 break;
+            case 'tidal-connect-start': {
+                const { tidalDeviceStart } = await import('@/lib/platforms/tidal');
+                data = await tidalDeviceStart();
+                break;
+            }
+            case 'tidal-connect-poll': {
+                if (!body?.deviceCode) throw new Error('deviceCode required');
+                const { tidalDevicePoll } = await import('@/lib/platforms/tidal');
+                const r = await tidalDevicePoll(String(body.deviceCode));
+                data = { status: r.status, connected: r.status === 'done' };
+                break;
+            }
             default:
                 throw new Error(`unknown action ${action}`);
         }

@@ -241,13 +241,20 @@ const AdminPanel = () => {
                         </div>
                         <Separator />
                         <div className='space-y-2'>
-                            <p className='font-medium text-sm'>Tidal session refresh token</p>
+                            <p className='font-medium text-sm'>Connect a Tidal account</p>
+                            <TidalConnect password={authed!} />
+                            <p className='text-[10px] text-muted-foreground'>
+                                One-time pairing — click Connect, type the code at link.tidal.com while logged in. Access tokens
+                                auto-refresh forever after that (Tidal free accounts get the platform&apos;s preview tier).
+                            </p>
+                        </div>
+                        <div className='space-y-2'>
+                            <p className='font-medium text-sm'>Tidal refresh token (manual)</p>
                             <TidalRefreshSetting
                                 onSave={(v) => mutate(() => adminCall(authed!, 'set-setting', { key: 'tidalRefreshToken', value: v }))}
                             />
                             <p className='text-[10px] text-muted-foreground'>
-                                Listen.tidal.com DevTools → Application → Local Storage → the oauth entry&apos;s
-                                refresh token. Paste once — access tokens re-mint automatically when the Bearer dies.
+                                Only if Connect is blocked — paste a raw refresh token here and access tokens still re-mint on expiry.
                             </p>
                         </div>
                         <Separator />
@@ -281,6 +288,89 @@ const AdminPanel = () => {
                 </SheetContent>
             </Sheet>
         </>
+    );
+};
+
+const TidalConnect = ({ password }: { password: string }) => {
+    const [state, setState] = useState<'idle' | 'starting' | 'waiting' | 'done' | 'error'>('idle');
+    const [code, setCode] = useState('');
+    const [url, setUrl] = useState('');
+    const [message, setMessage] = useState('');
+    const deviceRef = useRef<{ code: string; timer?: any }>({ code: '' });
+
+    const stop = () => {
+        if (deviceRef.current.timer) clearTimeout(deviceRef.current.timer);
+        deviceRef.current.timer = undefined;
+    };
+    useEffect(() => stop, []);
+
+    const poll = async (deviceCode: string) => {
+        try {
+            const json = await adminCall(password, 'tidal-connect-poll', { deviceCode });
+            const st = json?.data?.status;
+            if (st === 'done') {
+                stop();
+                setState('done');
+                setMessage('Connected — Tidal tokens auto-refresh from now on');
+                setCode('');
+                return;
+            }
+            if (st === 'expired') {
+                stop();
+                setState('error');
+                setMessage('Code expired — click Connect again');
+                return;
+            }
+            deviceRef.current.timer = setTimeout(() => poll(deviceCode), 2500);
+        } catch {
+            deviceRef.current.timer = setTimeout(() => poll(deviceCode), 4000);
+        }
+    };
+
+    const start = async () => {
+        setState('starting');
+        setMessage('');
+        try {
+            const json = await adminCall(password, 'tidal-connect-start');
+            const d = json?.data ?? {};
+            if (!d.deviceCode) throw new Error('no device code');
+            setCode(d.userCode);
+            setUrl(d.verificationUrl);
+            setState('waiting');
+            poll(d.deviceCode);
+            setTimeout(() => {
+                if (deviceRef.current.timer) {
+                    stop();
+                    setState('error');
+                    setMessage('Timed out — click Connect again');
+                }
+            }, (d.expiresIn ?? 300) * 1000);
+        } catch (e: any) {
+            setState('error');
+            setMessage(e?.message ?? 'failed to start');
+        }
+    };
+
+    return (
+        <div className='space-y-2'>
+            <div className='flex items-center gap-2'>
+                <Button type='button' variant='outline' size='sm' onClick={start} disabled={state === 'starting' || state === 'waiting'}>
+                    {state === 'waiting' ? 'Waiting for link.tidal.com…' : state === 'starting' ? 'Starting…' : 'Connect Tidal'}
+                </Button>
+                {state === 'waiting' && url && (
+                    <a href={url} target='_blank' rel='noreferrer' className='text-xs text-primary underline underline-offset-2'>
+                        open {url.replace(/^https?:\/\//, '')}
+                    </a>
+                )}
+            </div>
+            {state === 'waiting' && code && (
+                <div className='rounded-md border border-border bg-muted/40 px-3 py-2'>
+                    <p className='text-[10px] text-muted-foreground'>Type this code at link.tidal.com:</p>
+                    <p className='font-mono text-2xl font-bold tracking-[0.3em]'>{code}</p>
+                </div>
+            )}
+            {message && <p className={cn('text-xs', state === 'error' ? 'text-destructive' : 'text-green-500')}>{message}</p>}
+        </div>
     );
 };
 

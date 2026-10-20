@@ -147,8 +147,55 @@ const badTokens = new Set<string>();
 // access tokens indefinitely; Tidal rotates refresh tokens so each mint
 // persists the replacement.
 const TIDAL_SESSION_FILE = path.join(process.cwd(), 'data', 'tidal-session.json');
-const TIDAL_CLIENT_ID = '8049';
+// Tidal's TV/device client — public pair used by the official device-auth flow
+// (link.tidal.com). Refresh tokens are bound to the issuing client, so both the
+// device-code grant and the refresh grant must authenticate as this client.
+const TIDAL_OAUTH_CLIENT = { id: '8SEZWa4J1NVC5U5Y', secret: 'owUYDkxddz+9FpvGX24DlxECNtFEMBxipU0lBfrbq60=' };
 let tidalRefreshing: Promise<string | null> | null = null;
+
+// ---- device-auth connect (link.tidal.com) -------------------------------------
+// One-time pairing: we mint a userCode, the user types it at link.tidal.com while
+// logged in, we poll the token endpoint and capture access+refresh tokens.
+export async function tidalDeviceStart(): Promise<{ deviceCode: string; userCode: string; verificationUrl: string; expiresIn: number; interval: number }> {
+    const res = await axios.post(
+        'https://auth.tidal.com/v1/oauth2/device_authorization',
+        new URLSearchParams({ client_id: TIDAL_OAUTH_CLIENT.id, scope: 'r_usr w_usr' }),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 }
+    );
+    const d = res.data ?? {};
+    return {
+        deviceCode: d.deviceCode,
+        userCode: d.userCode,
+        verificationUrl: d.verificationUriComplete ? `https://${d.verificationUriComplete}` : `https://${d.verificationUri ?? 'link.tidal.com'}`,
+        expiresIn: d.expiresIn ?? 300,
+        interval: d.interval ?? 2,
+    };
+}
+
+// 'pending' | 'expired' | {accessToken, refreshToken}
+export async function tidalDevicePoll(deviceCode: string): Promise<{ status: string; accessToken?: string; refreshToken?: string }> {
+    try {
+        const res = await axios.post(
+            'https://auth.tidal.com/v1/oauth2/token',
+            new URLSearchParams({
+                grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+                device_code: deviceCode,
+                client_id: TIDAL_OAUTH_CLIENT.id,
+                client_secret: TIDAL_OAUTH_CLIENT.secret,
+            }),
+            { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 }
+        );
+        const { access_token, refresh_token, expires_in } = res.data ?? {};
+        if (!access_token) return { status: 'pending' };
+        tidalSessionStore({ access_token, refresh_token: refresh_token ?? '', expires_at: String(Date.now() + (expires_in ?? 0) * 1000) });
+        return { status: 'done', accessToken: access_token, refreshToken: refresh_token };
+    } catch (e: any) {
+        const err = e?.response?.data?.error;
+        if (err === 'authorization_pending' || err === 'slow_down') return { status: 'pending' };
+        if (err === 'expired_token' || err === 'access_denied') return { status: 'expired' };
+        return { status: 'pending' }; // transient — keep polling until expiry
+    }
+}
 
 function tidalSessionLoad(): { refresh_token?: string } | null {
     const raw = process.env.TIDAL_SESSION_JSON || (fs.existsSync(TIDAL_SESSION_FILE) ? fs.readFileSync(TIDAL_SESSION_FILE, 'utf-8') : null);
@@ -188,7 +235,13 @@ export async function refreshTidalToken(): Promise<string | null> {
             if (!refreshToken) return null;
             const res = await axios.post(
                 'https://auth.tidal.com/v1/oauth2/token',
-                new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: TIDAL_CLIENT_ID, scope: 'r_usr w_usr' }),
+                new URLSearchParams({
+                    grant_type: 'refresh_token',
+                    refresh_token: refreshToken,
+                    client_id: TIDAL_OAUTH_CLIENT.id,
+                    client_secret: TIDAL_OAUTH_CLIENT.secret,
+                    scope: 'r_usr w_usr',
+                }),
                 { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 20000 }
             );
             const { access_token, refresh_token: newRefresh, expires_in } = res.data ?? {};
@@ -254,7 +307,7 @@ export async function getTidalSession(ctx: RequestContext): Promise<{ countryCod
                 // refresh produced a token the sessions endpoint rejected — fall through
             }
         }
-        throw new Error("Tidal token expired — grab a fresh Bearer + the session's refresh token from listen.tidal.com DevTools (Application → Local Storage → oauth entry), and add it in the admin panel (double-click the corner dot)");
+        throw new Error('Tidal token expired — reconnect via the admin panel (double-click the corner dot) → Connect Tidal, or paste a fresh Bearer');
     }
     throw new Error('Tidal returned no usable session — add a Bearer token in the admin panel (double-click the corner dot)');
 }
