@@ -41,12 +41,15 @@ services:
       - key: APPLE_WRAPPER_URL
         value: http://136.111.58.129:12340
 
-  - type: worker
+  # free plan forbids background_worker — it runs as a web service that binds
+  # $PORT with a health endpoint (also a pinger target for cold-start keep-alive)
+  - type: web
     name: max-tune-worker
     runtime: node
     plan: free
     buildCommand: npm ci && npm run build:worker && bash tools/provision-worker.sh
     startCommand: node worker.mjs
+    healthCheckPath: /
     envVars:
       - fromGroup: maxtune-shared
       - key: NODE_VERSION

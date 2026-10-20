@@ -8,9 +8,19 @@
 //   WORKER_CAPS=generic,apple    also poll apple (needs APPLE_WRAPPER_URL reachable)
 //
 // Bundled to worker.cjs via `npm run build:worker` — no runtime deps on next.
+import http from 'http';
 import { dequeueJob, jobGet, jobSet, queueEnabled } from '../lib/queue';
 import { cacheEnabled, cachePut, presignGet, cacheKeyFor, objectKey } from '../lib/download-cache';
 import { produceTrackBytes, tagAndEncode, type DownloadSpec } from '../lib/server-download';
+
+// Render free tier only offers web services — the worker must bind a port or
+// the platform kills it after the port-scan timeout. This tiny listener doubles
+// as the health check + external-pinger target.
+const PORT = Number(process.env.PORT ?? 3101);
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, caps: CAPS, up: Math.floor(process.uptime()) }));
+}).listen(PORT, () => console.log(`[worker] health on :${PORT}`));
 
 const CAPS = (process.env.WORKER_CAPS ?? 'generic').split(',').map((s) => s.trim()).filter(Boolean);
 const POLL_MS = Number(process.env.WORKER_POLL_MS ?? 2500);
