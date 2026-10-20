@@ -21,6 +21,10 @@ envVarGroups:
         sync: false
       - key: AMAZON_MUSIC_TOKEN
         sync: false
+      - key: TIDAL_ACCESS_TOKEN
+        sync: false
+      - key: TIDAL_REFRESH_TOKEN
+        sync: false
       - key: DEEZER_ARL
         sync: false
       - key: QOBUZ_APP_ID
