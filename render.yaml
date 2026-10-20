@@ -17,6 +17,10 @@ envVarGroups:
         sync: false
       - key: APPLE_MEDIA_USER_TOKEN
         sync: false
+      - key: AMAZON_SESSION_JSON
+        sync: false
+      - key: AMAZON_MUSIC_TOKEN
+        sync: false
       - key: DEEZER_ARL
         sync: false
       - key: QOBUZ_APP_ID
