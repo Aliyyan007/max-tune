@@ -136,6 +136,29 @@ export function materializeSessions() {
     write('amazon-device.wvd', process.env.AMAZON_DEVICE_WVD_B64, true);
 }
 
+// Durable session material on ephemeral hosts: the connect flows run on the web
+// process and write to its private disk — Redis is the shared store. The worker
+// hydrates at boot and lazily when a cred file is absent.
+let sessionsHydrated = false;
+export async function hydrateSessionsFromRedis(): Promise<void> {
+    if (sessionsHydrated) return;
+    sessionsHydrated = true;
+    try {
+        const { kvGet } = await import('../queue');
+        const dir = path.join(process.cwd(), 'data');
+        const writeIfAbsent = async (name: string, key: string) => {
+            const p = path.join(dir, name);
+            if (fs.existsSync(p)) return;
+            const v = await kvGet(key);
+            if (!v) return;
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(p, v);
+        };
+        await writeIfAbsent('spotify-redis.json', 'session:spotify');
+        await writeIfAbsent('amazon-session.json', 'session:amazon');
+    } catch {}
+}
+
 // Serialize every librespot-session spawn — Spotify's AP drops concurrent sessions on
 // the same account (RemoteDisconnected), so parallel python calls kill each other.
 let librespotQueue: Promise<void> = Promise.resolve();
@@ -155,7 +178,12 @@ const SPOTIFY_ATTEMPTS = 3;
 // Auth comes from the stored OAuth session written by the Settings → Connect Spotify flow
 // (tools/spotify-login.py) — the account's tier decides what the keys unlock.
 export async function downloadSpotifyNative(trackId: string, quality: 'normal' | 'high' | 'very_high' | 'lossless'): Promise<NativeResult> {
-    const stored = spotifyCredFile();
+    let stored = spotifyCredFile();
+    if (!stored) {
+        // web-side Connect wrote the session to Redis on hosted deploys — pull it
+        await hydrateSessionsFromRedis();
+        stored = spotifyCredFile();
+    }
     if (!stored) throw new Error('Spotify account not connected — use Settings → Connect Spotify to link one');
     const args = [
         path.join(process.cwd(), 'tools', 'spotify-native.py'),

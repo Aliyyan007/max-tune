@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { execFile } from 'child_process';
+import fs from 'fs';
 import path from 'path';
 import z from 'zod';
 import { PY_BIN, PY_ENV } from '@/lib/platforms/native-tools';
@@ -40,6 +41,22 @@ export async function POST(request: NextRequest) {
         const { url } = bodySchema.parse(await request.json());
         const data = await run(['--finish', url]);
         if (!data?.ok) return Response.json({ success: false, error: data?.error ?? 'exchange failed' }, { status: 400 });
+        // Persist the session to Redis so the WORKER sees it — web/worker have
+        // separate ephemeral disks on hosted deploys.
+        try {
+            const { kvSet } = await import('@/lib/queue');
+            const dataDir = path.join(process.cwd(), 'data');
+            const files = fs.readdirSync(dataDir);
+            const newest = (pat: RegExp) =>
+                files
+                    .filter((f) => pat.test(f))
+                    .map((f) => path.join(dataDir, f))
+                    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+            const session = newest(/^spotify-(?!oauth-|pkce-).*\.json$/);
+            const oauth = newest(/^spotify-oauth-.*\.json$/);
+            if (session) await kvSet('session:spotify', fs.readFileSync(session, 'utf-8'));
+            if (oauth) await kvSet('session:spotify-oauth', fs.readFileSync(oauth, 'utf-8'));
+        } catch {}
         return Response.json({ success: true, data });
     } catch (e: any) {
         return Response.json({ success: false, error: e?.message ?? 'failed' }, { status: 500 });

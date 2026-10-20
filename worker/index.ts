@@ -12,6 +12,7 @@ import http from 'http';
 import { dequeueJob, jobDone, jobGet, jobSet, queueEnabled } from '../lib/queue';
 import { cacheEnabled, cachePut, presignGet, cacheKeyFor, objectKey } from '../lib/download-cache';
 import { produceTrackBytes, tagAndEncode, type DownloadSpec } from '../lib/server-download';
+import { hydrateSessionsFromRedis } from '../lib/platforms/native-tools';
 
 // Render free tier only offers web services — the worker must bind a port or
 // the platform kills it after the port-scan timeout. This tiny listener doubles
@@ -73,6 +74,9 @@ async function main() {
         console.error('UPSTASH_REDIS_URL/UPSTASH_REDIS_TOKEN not set — worker cannot start');
         process.exit(1);
     }
+    // Pull provider sessions written by the web process's connect flows — the
+    // two disks don't share storage, Redis is the bridge.
+    await hydrateSessionsFromRedis().catch(() => {});
     console.log(`[worker] up — caps=${CAPS.join('+')} cache=${cacheEnabled() ? 'r2' : 'inline'}`);
     let idle = 0;
     for (;;) {

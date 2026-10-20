@@ -61,8 +61,16 @@ function storeToken(token: string) {
 export async function refreshAmazonToken(): Promise<string | null> {
     refreshing ??= (async () => {
         try {
-            // env first (hosted deploys ship the session as AMAZON_SESSION_JSON), then the file
-            const raw = process.env.AMAZON_SESSION_JSON || (fs.existsSync(SESSION_FILE) ? fs.readFileSync(SESSION_FILE, 'utf-8') : null);
+            // env first (hosted deploys ship the session as AMAZON_SESSION_JSON), then
+            // the file, then the shared Redis copy written by whichever process last
+            // exported it.
+            let raw = process.env.AMAZON_SESSION_JSON || (fs.existsSync(SESSION_FILE) ? fs.readFileSync(SESSION_FILE, 'utf-8') : null);
+            if (!raw) {
+                try {
+                    const { kvGet } = await import('../queue');
+                    raw = await kvGet('session:amazon');
+                } catch {}
+            }
             if (!raw) return null;
             const session = JSON.parse(raw);
             const cookies = session.website_cookies;
@@ -100,6 +108,9 @@ async function ensureSessionExport(token: string) {
         if (data?.website_cookies || data?.refresh_token) {
             fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true });
             fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
+            // durable copy — Render's disk is ephemeral and the worker is a
+            // separate process; without this a redeploy loses the session
+            import('../queue').then((q) => q.kvSet('session:amazon', JSON.stringify(data))).catch(() => {});
             sessionExportedFor = token;
         }
     } catch {}
