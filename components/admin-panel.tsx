@@ -241,6 +241,17 @@ const AdminPanel = () => {
                         </div>
                         <Separator />
                         <div className='space-y-2'>
+                            <p className='font-medium text-sm'>Tidal session refresh token</p>
+                            <TidalRefreshSetting
+                                onSave={(v) => mutate(() => adminCall(authed!, 'set-setting', { key: 'tidalRefreshToken', value: v }))}
+                            />
+                            <p className='text-[10px] text-muted-foreground'>
+                                Listen.tidal.com DevTools → Application → Local Storage → the oauth entry&apos;s
+                                refresh token. Paste once — access tokens re-mint automatically when the Bearer dies.
+                            </p>
+                        </div>
+                        <Separator />
+                        <div className='space-y-2'>
                             <p className='font-medium text-sm'>Apple wrapper-lite URL</p>
                             <AppleWrapperSetting
                                 current={stats?.settings?.appleWrapperUrl}
@@ -270,6 +281,18 @@ const AdminPanel = () => {
                 </SheetContent>
             </Sheet>
         </>
+    );
+};
+
+const TidalRefreshSetting = ({ onSave }: { onSave: (v: string) => void }) => {
+    const [val, setVal] = useState('');
+    return (
+        <div className='flex gap-2'>
+            <Input type='password' placeholder='Paste refresh token…' value={val} onChange={(e) => setVal(e.target.value)} className='text-xs' />
+            <Button type='button' size='sm' variant='outline' onClick={() => onSave(val)}>
+                Save
+            </Button>
+        </div>
     );
 };
 

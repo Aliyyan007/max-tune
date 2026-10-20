@@ -1,5 +1,7 @@
 import axios from 'axios';
-import { pickToken, reportToken, tokensFor } from '@/lib/token-pool';
+import fs from 'fs';
+import path from 'path';
+import { pickToken, reportToken, tokensFor, getSetting, admin } from '@/lib/token-pool';
 import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, QualityId, RequestContext } from './types';
 import type { FetchedQobuzAlbum, QobuzAlbum, QobuzTrack } from '@/lib/qobuz-dl';
@@ -138,6 +140,71 @@ async function enrichTrackAlbums(items: any[], countryCode: string, ctx: Request
 // tokens that failed the sessions probe — skip them so metadata keeps working anonymously
 const badTokens = new Set<string>();
 
+// ---------------- token refresh ----------------
+// The Bearer JWT caps at ~7 days, but the OAuth session behind it carries a
+// refresh token (browser localStorage on listen.tidal.com — same DevTools trip
+// the user already makes for the Bearer). Store it once and we mint fresh
+// access tokens indefinitely; Tidal rotates refresh tokens so each mint
+// persists the replacement.
+const TIDAL_SESSION_FILE = path.join(process.cwd(), 'data', 'tidal-session.json');
+const TIDAL_CLIENT_ID = '8049';
+let tidalRefreshing: Promise<string | null> | null = null;
+
+function tidalSessionLoad(): { refresh_token?: string } | null {
+    const raw = process.env.TIDAL_SESSION_JSON || (fs.existsSync(TIDAL_SESSION_FILE) ? fs.readFileSync(TIDAL_SESSION_FILE, 'utf-8') : null);
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return { refresh_token: raw.trim().replace(/^"|"$/g, '') };
+    }
+}
+
+function tidalSessionStore(fields: Record<string, string>) {
+    try {
+        fs.mkdirSync(path.dirname(TIDAL_SESSION_FILE), { recursive: true });
+        fs.writeFileSync(TIDAL_SESSION_FILE, JSON.stringify(fields, null, 2));
+    } catch {}
+    // rotated refresh token persists in the settings store so restarts keep the session
+    if (fields.refresh_token) {
+        try {
+            admin.setSetting('tidalRefreshToken', fields.refresh_token);
+        } catch {}
+        process.env.TIDAL_REFRESH_TOKEN = fields.refresh_token;
+    }
+    if (fields.access_token) {
+        process.env.TIDAL_ACCESS_TOKEN = fields.access_token;
+        try {
+            admin.add('tidal', fields.access_token, 'auto-refresh');
+        } catch {}
+    }
+}
+
+export async function refreshTidalToken(): Promise<string | null> {
+    tidalRefreshing ??= (async () => {
+        try {
+            const session = tidalSessionLoad();
+            const refreshToken = getSetting('tidalRefreshToken') || session?.refresh_token || process.env.TIDAL_REFRESH_TOKEN;
+            if (!refreshToken) return null;
+            const res = await axios.post(
+                'https://auth.tidal.com/v1/oauth2/token',
+                new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: TIDAL_CLIENT_ID, scope: 'r_usr w_usr' }),
+                { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 20000 }
+            );
+            const { access_token, refresh_token: newRefresh, expires_in } = res.data ?? {};
+            if (!access_token) return null;
+            badTokens.delete(access_token);
+            tidalSessionStore({ access_token, refresh_token: newRefresh ?? refreshToken, expires_at: String(Date.now() + (expires_in ?? 0) * 1000) });
+            return String(access_token);
+        } catch {
+            return null;
+        } finally {
+            setTimeout(() => (tidalRefreshing = null), 0);
+        }
+    })();
+    return tidalRefreshing;
+}
+
 function headers(ctx: RequestContext): Record<string, string> {
     const token = pickToken('tidal') || ctx.tokens.tidalToken || process.env.TIDAL_ACCESS_TOKEN;
     if (token && !badTokens.has(token)) return { authorization: `Bearer ${token}`, 'User-Agent': UA };
@@ -173,7 +240,22 @@ export async function getTidalSession(ctx: RequestContext): Promise<{ countryCod
             throw e;
         }
     }
-    if (expired) throw new Error('Tidal token expired — grab a fresh Bearer from listen.tidal.com DevTools → Network → any api.tidal.com request, and add it in the admin panel (double-click the corner dot)');
+    if (expired) {
+        // Bearer died — mint a fresh one from the stored OAuth refresh token
+        const fresh = await refreshTidalToken();
+        if (fresh) {
+            ctx.tokens.tidalToken = fresh;
+            try {
+                const res = await axios.get(`${BASE}/sessions`, { headers: { authorization: `Bearer ${fresh}`, 'User-Agent': UA }, timeout: 15000 });
+                const session = { countryCode: res.data.countryCode ?? 'US', userId: res.data.userId, at: Date.now() };
+                sessionCache.set(fresh, session);
+                return session;
+            } catch {
+                // refresh produced a token the sessions endpoint rejected — fall through
+            }
+        }
+        throw new Error("Tidal token expired — grab a fresh Bearer + the session's refresh token from listen.tidal.com DevTools (Application → Local Storage → oauth entry), and add it in the admin panel (double-click the corner dot)");
+    }
     throw new Error('Tidal returned no usable session — add a Bearer token in the admin panel (double-click the corner dot)');
 }
 
