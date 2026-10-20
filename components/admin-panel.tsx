@@ -307,7 +307,7 @@ const TidalConnect = ({ password }: { password: string }) => {
     const poll = async (deviceCode: string) => {
         try {
             const json = await adminCall(password, 'tidal-connect-poll', { deviceCode });
-            const st = json?.data?.status;
+            const st = json?.status;
             if (st === 'done') {
                 stop();
                 setState('done');
@@ -331,8 +331,7 @@ const TidalConnect = ({ password }: { password: string }) => {
         setState('starting');
         setMessage('');
         try {
-            const json = await adminCall(password, 'tidal-connect-start');
-            const d = json?.data ?? {};
+            const d = (await adminCall(password, 'tidal-connect-start')) ?? {};
             if (!d.deviceCode) throw new Error('no device code');
             setCode(d.userCode);
             setUrl(d.verificationUrl);
