@@ -9,7 +9,7 @@
 //
 // Bundled to worker.cjs via `npm run build:worker` — no runtime deps on next.
 import http from 'http';
-import { dequeueJob, jobGet, jobSet, queueEnabled } from '../lib/queue';
+import { dequeueJob, jobDone, jobGet, jobSet, queueEnabled } from '../lib/queue';
 import { cacheEnabled, cachePut, presignGet, cacheKeyFor, objectKey } from '../lib/download-cache';
 import { produceTrackBytes, tagAndEncode, type DownloadSpec } from '../lib/server-download';
 
@@ -90,6 +90,8 @@ async function main() {
             } catch (e: any) {
                 console.log(`[worker] ${id.slice(0, 8)} failed: ${e?.message?.slice(0, 200) ?? e}`);
                 await jobSet(id, { stage: 'error', error: String(e?.message ?? e).slice(0, 500), at: Date.now() }).catch(() => {});
+            } finally {
+                await jobDone(id).catch(() => {});
             }
         } catch (e: any) {
             console.log(`[worker] poll error: ${e?.message?.slice(0, 160) ?? e}`);

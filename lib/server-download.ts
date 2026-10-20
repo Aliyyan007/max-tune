@@ -12,7 +12,7 @@ import ffmpegPath from 'ffmpeg-static';
 import { adapters } from './platforms';
 import { getSetting } from './token-pool';
 import { resolveDeezerTrack, decryptDeezerFile, blowfishKey } from './platforms/deezer';
-import { resolveTidalTrack } from './platforms/tidal';
+import { resolveTidalTrack, resolveTidalPreview } from './platforms/tidal';
 import { downloadSpotifyNative, downloadAppleNative, downloadAmazonNative, resolveAmazonStream, PY_ENV, PY_BIN, withLibrespotLock, materializeSessions } from './platforms/native-tools';
 import { Blowfish } from 'egoroof-blowfish';
 import type { PlatformSource, RequestContext } from './platforms/types';
@@ -197,9 +197,17 @@ export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buf
     }
 
     if (source === 'tidal') {
-        const info = await resolveTidalTrack(id, quality as any, ctx);
-        if (info.dashManifest) return { data: await assembleDash(info.dashManifest), format: 'mp4' };
-        return { data: await fetchBuf(info.url!, { 'User-Agent': 'Mozilla/5.0' }), format: info.format ?? 'flac' };
+        try {
+            const info = await resolveTidalTrack(id, quality as any, ctx);
+            if (info.dashManifest) return { data: await assembleDash(info.dashManifest), format: 'mp4' };
+            return { data: await fetchBuf(info.url!, { 'User-Agent': 'Mozilla/5.0' }), format: info.format ?? 'flac' };
+        } catch (e: any) {
+            // no usable session (missing/expired token) → the web player's anonymous
+            // mp3 preview is what this request can legally fetch — honest fallback.
+            if (!/expired|session|access token|no usable/i.test(e?.message ?? '')) throw e;
+            const p = await resolveTidalPreview(id);
+            return { data: await fetchBuf(p.url, { 'User-Agent': 'Mozilla/5.0' }), format: 'mp3' };
+        }
     }
 
     if (source === 'qobuz') {
@@ -678,10 +686,17 @@ async function produceTrackStream(spec: DownloadSpec): Promise<Upstream | null> 
     }
 
     if (source === 'tidal') {
-        const info = await resolveTidalTrack(id, quality as any, ctx);
-        if (info.dashManifest) return { stream: Readable.from(dashGen(info.dashManifest)), format: 'mp4' };
-        const up = await axiosStream(info.url!, { 'User-Agent': 'Mozilla/5.0' });
-        return { stream: up.stream, format: CT_FORMAT[up.contentType] ?? info.format ?? 'flac', contentLength: up.length };
+        try {
+            const info = await resolveTidalTrack(id, quality as any, ctx);
+            if (info.dashManifest) return { stream: Readable.from(dashGen(info.dashManifest)), format: 'mp4' };
+            const up = await axiosStream(info.url!, { 'User-Agent': 'Mozilla/5.0' });
+            return { stream: up.stream, format: CT_FORMAT[up.contentType] ?? info.format ?? 'flac', contentLength: up.length };
+        } catch (e: any) {
+            if (!/expired|session|access token|no usable/i.test(e?.message ?? '')) throw e;
+            const p = await resolveTidalPreview(id);
+            const up = await axiosStream(p.url, { 'User-Agent': 'Mozilla/5.0' });
+            return { stream: up.stream, format: 'mp3', contentLength: up.length };
+        }
     }
 
     if (source === 'qobuz') {

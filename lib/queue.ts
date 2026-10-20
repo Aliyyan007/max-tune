@@ -33,13 +33,42 @@ export async function enqueueJob(id: string, specJson: string, source: string): 
 }
 
 // caps: ['generic'] | ['apple'] | ['generic','apple'] — returns a job id or null.
+// Inflight lease: a claimed job lands in `inflight` (ZSET scored by claim time);
+// a worker that dies mid-job strands it — jobs stale >120s get requeued on the
+// next dequeue, and workers only hold their claim while actually running.
+const INFLIGHT = 'q:dl:inflight';
+const CLAIM_STALE_MS = 120_000;
+
+async function requeueStale(caps: string[]): Promise<void> {
+    const stale = (await cmd('ZRANGEBYSCORE', INFLIGHT, 0, Date.now() - CLAIM_STALE_MS)) ?? [];
+    for (const id of stale) {
+        const job = await jobGet(String(id));
+        const source = job?.spec ? (JSON.parse(job.spec).source ?? '') : '';
+        const q = queueFor(source);
+        // only requeue what this worker can serve; leave apple jobs for apple-capable workers
+        if ((q === QUEUE_APPLE && !caps.includes('apple')) || (q === QUEUE_GENERIC && !caps.includes('generic'))) continue;
+        await cmd('LPUSH', q, String(id));
+        await jobSet(String(id), { stage: 'queued' });
+        await cmd('ZREM', INFLIGHT, String(id));
+    }
+}
+
 export async function dequeueJob(caps: string[]): Promise<string | null> {
+    await requeueStale(caps).catch(() => {});
     for (const cap of ['apple', 'generic']) {
         if (!caps.includes(cap)) continue;
         const id = await cmd('RPOP', cap === 'apple' ? QUEUE_APPLE : QUEUE_GENERIC);
-        if (id) return String(id);
+        if (id) {
+            await cmd('ZADD', INFLIGHT, Date.now(), String(id));
+            return String(id);
+        }
     }
     return null;
+}
+
+// Call when a job reaches a terminal state (done/error) — clears the lease.
+export async function jobDone(id: string): Promise<void> {
+    await cmd('ZREM', INFLIGHT, String(id));
 }
 
 // ---------------- job state ----------------

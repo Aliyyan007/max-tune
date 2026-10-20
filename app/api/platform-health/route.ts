@@ -9,7 +9,9 @@ export const runtime = 'nodejs';
 async function wrapperUp(url: string): Promise<boolean> {
     try {
         const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), 1500);
+        // TCG-loaded wrappers take >10s to answer /status — give it room so a
+        // slow-but-alive wrapper doesn't read as "unconfigured" in the picker.
+        const t = setTimeout(() => ctrl.abort(), 15000);
         await fetch(`${url.replace(/\/$/, '')}/m3u8?adamId=0`, { signal: ctrl.signal });
         clearTimeout(t);
         return true;
