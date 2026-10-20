@@ -72,6 +72,26 @@ embedded-art checks), admin auth, and the album-zip flow for every platform.
 - Public wrapper federation is gRPC-only (`wm.wol.moe`) — no public lite-HTTP
   endpoints exist; multi-region means a second local wrapper + account.
 
+### Hosting wrapper-lite (self-hosting recipe)
+
+The wrapper is just an HTTP service — it needs *one machine that stays on*. The
+workers call it remotely via `APPLE_WRAPPER_URL`; it doesn't have to run beside them.
+
+**GCP always-free e2-micro** (this deployment):
+- `e2-micro`, Debian 12/13, us-central1/us-west1/us-east1, 30GB standard disk → $0/mo
+- `sudo apt install qemu-system-x86` → build `wrapper-lite-qemu` from the repo's
+  `lite` branch (`g++ wrapper-lite-qemu.cpp -o wrapper-lite-qemu`), copy
+  `vmlinuz-lite-qemu`/`lite-initramfs.cpio.gz`/`data.img` beside it
+- `data.img` carries the Apple login — move it with `scp` to keep the session
+- systemd unit launches the wrapper on boot; QEMU runs TCG (no /dev/kvm on
+  free tiers) — boot ~60-90s, then serves `0.0.0.0:12340`
+- Expose via VPC firewall rule `tcp:12340` (restrict source ranges to your
+  worker's egress IPs — the wrapper API is unauthenticated)
+
+**Alternatives**: any always-on Linux box can run `wrapper-lite-rootless` (user
+namespaces, no QEMU — near-native speed); a Windows machine runs
+`tools\wrapper\wrapper-lite-qemu.exe` directly (only while it's on).
+
 ## Upstream API architecture (per platform)
 
 - **Spotify** — primary path is the web-player's own federation gateway
