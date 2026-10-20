@@ -13,7 +13,13 @@ fi
 
 if command -v python3 >/dev/null 2>&1; then
   echo "[provision] python3 present — installing librespot + pywidevine"
-  (pip install --quiet "librespot==0.0.10" pywidevine requests || pip3 install --quiet "librespot==0.0.10" pywidevine requests || true) && echo "[provision] python deps ok" || echo "[provision] python deps failed — spotify/amazon jobs will surface errors"
+  PIP=$(command -v pip || command -v pip3 || true)
+  # one package per invocation — a single bad dep must not veto the rest
+  for pkg in "librespot==0.0.10" librespot pywidevine requests; do
+    [ -n "$PIP" ] && "$PIP" install --quiet "$pkg" >/dev/null 2>&1
+  done
+  python3 -c "import librespot" 2>/dev/null && echo "[provision] librespot ok" || echo "[provision] librespot MISSING — spotify jobs will surface errors"
+  python3 -c "import pywidevine" 2>/dev/null && echo "[provision] pywidevine ok" || echo "[provision] pywidevine MISSING — amazon jobs will surface errors"
 else
   echo "[provision] no python3 — spotify/amazon jobs will surface errors"
 fi
