@@ -1,0 +1,114 @@
+// Upstash-backed job queue — plain REST calls (no redis client dep), so this
+// also works from edge/serverless contexts. When env is absent every helper
+// reports disabled and callers keep the in-process path.
+const UPSTASH_URL = process.env.UPSTASH_REDIS_URL?.replace(/\/$/, '');
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_TOKEN;
+
+export const queueEnabled = () => !!(UPSTASH_URL && UPSTASH_TOKEN);
+
+async function cmd(...args: (string | number)[]): Promise<any> {
+    const r = await fetch(`${UPSTASH_URL}/${args.map((a) => encodeURIComponent(String(a))).join('/')}`, {
+        headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+    });
+    const j = await r.json().catch(() => null);
+    if (!r.ok) throw new Error(`upstash ${args[0]}: ${r.status} ${JSON.stringify(j)}`);
+    return j?.result;
+}
+
+// ---------------- queues ----------------
+// Capability routing: apple jobs need a wrapper-adjacent worker; everything
+// else is generic. Two lists keep it explicit — a worker's caps decide which
+// it polls (apple-capable workers poll both, apple first).
+export const QUEUE_GENERIC = 'q:dl:generic';
+export const QUEUE_APPLE = 'q:dl:apple';
+
+export function queueFor(source: string): string {
+    return source === 'apple' || source === 'apple-native' ? QUEUE_APPLE : QUEUE_GENERIC;
+}
+
+export async function enqueueJob(id: string, specJson: string, source: string): Promise<void> {
+    await cmd('HSET', `job:${id}`, 'spec', specJson, 'stage', 'queued', 'at', Date.now());
+    await cmd('EXPIRE', `job:${id}`, 3600);
+    await cmd('LPUSH', queueFor(source), id);
+}
+
+// caps: ['generic'] | ['apple'] | ['generic','apple'] — returns a job id or null.
+export async function dequeueJob(caps: string[]): Promise<string | null> {
+    for (const cap of ['apple', 'generic']) {
+        if (!caps.includes(cap)) continue;
+        const id = await cmd('RPOP', cap === 'apple' ? QUEUE_APPLE : QUEUE_GENERIC);
+        if (id) return String(id);
+    }
+    return null;
+}
+
+// ---------------- job state ----------------
+export interface RemoteJob {
+    spec?: string;
+    stage?: string;
+    received?: string;
+    sent?: string;
+    total?: string;
+    label?: string;
+    error?: string;
+    resultUrl?: string;
+    resultExt?: string;
+    resultName?: string;
+    cancelled?: string;
+    taken?: string;
+    at?: string;
+}
+
+export async function jobSet(id: string, fields: Record<string, string | number>): Promise<void> {
+    const flat: (string | number)[] = [];
+    for (const [k, v] of Object.entries(fields)) flat.push(k, v);
+    await cmd('HSET', `job:${id}`, ...flat);
+    await cmd('EXPIRE', `job:${id}`, 3600);
+}
+
+export async function jobGet(id: string): Promise<RemoteJob | null> {
+    const arr = await cmd('HGETALL', `job:${id}`);
+    if (!arr || !arr.length) return null;
+    const out: Record<string, string> = {};
+    for (let i = 0; i < arr.length; i += 2) out[String(arr[i])] = String(arr[i + 1]);
+    return out as RemoteJob;
+}
+
+// ---------------- cache index (shared with download-cache) ----------------
+// `cache:index` — ZSET member=object-key score=lastAccess; `cache:total` — INT bytes.
+export async function cacheTouch(key: string): Promise<void> {
+    await cmd('ZADD', 'cache:index', Date.now(), key);
+}
+
+export async function cacheAddBytes(n: number): Promise<number> {
+    return Number(await cmd('INCRBY', 'cache:total', n));
+}
+
+export async function cacheSubBytes(n: number): Promise<number> {
+    return Number(await cmd('INCRBY', 'cache:total', -n));
+}
+
+export async function cacheTotal(): Promise<number> {
+    return Number((await cmd('GET', 'cache:total')) ?? 0);
+}
+
+export async function cacheMetaSet(key: string, size: number): Promise<void> {
+    await cmd('HSET', `cache:meta:${key}`, 'size', size);
+}
+
+export async function cacheMetaGet(key: string): Promise<number> {
+    return Number((await cmd('HGET', `cache:meta:${key}`, 'size')) ?? 0);
+}
+
+export async function cacheMetaDel(key: string): Promise<void> {
+    await cmd('DEL', `cache:meta:${key}`);
+}
+
+// Oldest N members of the LRU index.
+export async function cacheOldest(n: number): Promise<string[]> {
+    return (await cmd('ZRANGE', 'cache:index', 0, n - 1)) ?? [];
+}
+
+export async function cacheIndexDel(key: string): Promise<void> {
+    await cmd('ZREM', 'cache:index', key);
+}

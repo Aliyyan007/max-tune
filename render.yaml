@@ -1,0 +1,72 @@
+# Render blueprint — web app + download worker on free tier.
+# Env vars marked sync:false are set in the Render dashboard (secrets).
+services:
+  - type: web
+    name: maxtune-web
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npx next start -p $PORT
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: UPSTASH_REDIS_URL
+        sync: false
+      - key: UPSTASH_REDIS_TOKEN
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: APPLE_WRAPPER_URL
+        value: http://136.111.58.129:12340
+      - key: APPLE_MEDIA_USER_TOKEN
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: QOBUZ_APP_ID
+        sync: false
+      - key: QOBUZ_APP_SECRET
+        sync: false
+      - key: DEEZER_ARL
+        sync: false
+
+  - type: web
+    name: maxtune-worker
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build:worker && bash tools/provision-worker.sh
+    startCommand: node worker.mjs
+    # workers don't serve HTTP — Render pings nothing if healthCheckPath is unset
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: WORKER_CAPS
+        value: generic,apple
+      - key: UPSTASH_REDIS_URL
+        sync: false
+      - key: UPSTASH_REDIS_TOKEN
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: APPLE_WRAPPER_URL
+        value: http://136.111.58.129:12340
+      - key: APPLE_MEDIA_USER_TOKEN
+        sync: false
+      - key: DEEZER_ARL
+        sync: false
+      - key: QOBUZ_APP_ID
+        sync: false
+      - key: QOBUZ_APP_SECRET
+        sync: false

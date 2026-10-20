@@ -1,0 +1,64 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+.env.local
+
+# environment
+.env*
+!.env.example
+# stored platform sessions + native tool binaries
+data/
+bin/
+
+# platform credentials & sessions (never commit)
+credentials.json
+*.wvd
+*-session.json
+spotify-*.json
+
+# local build workaround dir (apostrophe-path / temp-permission fixes)
+/.tmp/
+
+*.log
+# wrapper-lite service (300MB qemu image + session state)
+tools/wrapper/
+
+worker.mjs
+
+# reference implementation sources (853MB, not part of this app)
+Reference Code/
