@@ -34,9 +34,8 @@ services:
     buildCommand: npm ci && npm run build
     startCommand: npx next start -p $PORT
     healthCheckPath: /
-    envGroups:
-      - maxtune-shared
     envVars:
+      - fromGroup: maxtune-shared
       - key: NODE_VERSION
         value: "22"
       - key: APPLE_WRAPPER_URL
@@ -48,9 +47,8 @@ services:
     plan: free
     buildCommand: npm ci && npm run build:worker && bash tools/provision-worker.sh
     startCommand: node worker.mjs
-    envGroups:
-      - maxtune-shared
     envVars:
+      - fromGroup: maxtune-shared
       - key: NODE_VERSION
         value: "22"
       - key: WORKER_CAPS
