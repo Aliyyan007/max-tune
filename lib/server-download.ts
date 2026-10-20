@@ -322,7 +322,10 @@ async function appleCrossPlatformFallback(spec: DownloadSpec, ctx: RequestContex
                     const dur = Number(t.duration) || 0;
                     if (wantTitle && name !== wantTitle && normTitle(name) !== wantNorm) return false;
                     if (spec.duration && dur && Math.abs(dur - spec.duration) > 12) return false; // remixes/interludes diverge
-                    if (wantArtist && perf && !perf.includes(wantArtist) && !wantArtist.includes(perf)) return false;
+                    // only apply the artist check when the caller sent a real name —
+                    // a placeholder like 'x' would reject every genuine match
+                    const artistUsable = wantArtist.length > 1 && wantArtist !== 'x';
+                    if (artistUsable && perf && !perf.includes(wantArtist) && !wantArtist.includes(perf)) return false;
                     return true;
                 });
             }

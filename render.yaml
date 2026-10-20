@@ -19,7 +19,11 @@ envVarGroups:
         sync: false
       - key: AMAZON_SESSION_JSON
         sync: false
+      - key: AMAZON_DEVICE_WVD_B64
+        sync: false
       - key: AMAZON_MUSIC_TOKEN
+        sync: false
+      - key: SPOTIFY_SESSION_JSON
         sync: false
       - key: TIDAL_ACCESS_TOKEN
         sync: false
