@@ -13,6 +13,7 @@ import { adapters } from './platforms';
 import { getSetting } from './token-pool';
 import { resolveDeezerTrack, decryptDeezerFile, blowfishKey } from './platforms/deezer';
 import { resolveTidalTrack, resolveTidalPreview } from './platforms/tidal';
+import { getDownloadInfo } from './qobuz-dl-server';
 import { downloadSpotifyNative, downloadAppleNative, downloadAmazonNative, resolveAmazonStream, PY_ENV, PY_BIN, withLibrespotLock, materializeSessions } from './platforms/native-tools';
 import { Blowfish } from 'egoroof-blowfish';
 import type { PlatformSource, RequestContext } from './platforms/types';
@@ -189,6 +190,9 @@ async function assembleDash(mpd: string): Promise<Buffer> {
 export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buffer; format: string }> {
     const ctx: RequestContext = { tokens: (spec.tokens ?? {}) as any, country: spec.country };
     const { source, id, quality } = spec;
+    // __fb counts fallback depth — a provider inside a fallback chain must not
+    // start its own chain (deezer→tidal→qobuz could ping-pong forever).
+    const fbDepth = (spec as any).__fb ?? 0;
 
     if (source === 'deezer') {
         const info = await resolveDeezerTrack(id, quality as any, ctx);
@@ -197,22 +201,47 @@ export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buf
     }
 
     if (source === 'tidal') {
+        let out: { data: Buffer; format: string };
         try {
             const info = await resolveTidalTrack(id, quality as any, ctx);
-            if (info.dashManifest) return { data: await assembleDash(info.dashManifest), format: 'mp4' };
-            return { data: await fetchBuf(info.url!, { 'User-Agent': 'Mozilla/5.0' }), format: info.format ?? 'flac' };
+            out = info.dashManifest
+                ? { data: await assembleDash(info.dashManifest), format: 'mp4' }
+                : { data: await fetchBuf(info.url!, { 'User-Agent': 'Mozilla/5.0' }), format: info.format ?? 'flac' };
         } catch (e: any) {
             // no usable session (missing/expired token) → the web player's anonymous
             // mp3 preview is what this request can legally fetch — honest fallback.
             if (!/expired|session|access token|no usable/i.test(e?.message ?? '')) throw e;
             const p = await resolveTidalPreview(id);
-            return { data: await fetchBuf(p.url, { 'User-Agent': 'Mozilla/5.0' }), format: 'mp3' };
+            out = { data: await fetchBuf(p.url, { 'User-Agent': 'Mozilla/5.0' }), format: 'mp3' };
         }
+        // A free-tier account resolves "successfully" but serves the PREVIEW asset
+        // — detect the clip by duration and let another provider serve the real
+        // track before shipping a 30s file.
+        if (fbDepth === 0 && spec.duration) {
+            const got = await probeDuration(out.data);
+            if (got > 0 && got < spec.duration * 0.6) {
+                const fb = await crossPlatformFallback(spec, ctx, ['deezer', 'qobuz']);
+                if (fb) return fb;
+            }
+        }
+        return out;
     }
 
     if (source === 'qobuz') {
-        const info = await adapters.qobuz.getDownloadURL(id, quality as any, ctx);
-        return { data: await fetchBuf(info.url, { 'User-Agent': 'Mozilla/5.0' }), format: info.format ?? 'flac' };
+        const info = await getDownloadInfo(Number(id), quality as any, ctx);
+        const data = await fetchBuf(info.url, { 'User-Agent': 'Mozilla/5.0' });
+        const mime = String(info.mime_type ?? '');
+        const out = { data, format: mime.includes('flac') ? 'flac' : mime.includes('mpeg') ? 'mp3' : mime.includes('mp4') ? 'm4a' : 'flac' };
+        // Uncredentialed/free account → Qobuz hands a 30s sample (sample:true or
+        // restriction codes). Probe the bytes — a clip means try the chain first.
+        if (fbDepth === 0 && spec.duration && (info.sample === true || (info.restrictions ?? []).length > 0)) {
+            const got = await probeDuration(data);
+            if (got > 0 && got < spec.duration * 0.6) {
+                const fb = await crossPlatformFallback(spec, ctx, ['deezer', 'tidal']);
+                if (fb) return fb;
+            }
+        }
+        return out;
     }
 
     if (source === 'spotify' || source === 'spotify-native') {
@@ -272,7 +301,7 @@ export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buf
             if (!/region-locked|not available in the account's storefront|amdl failed|wrapper-lite not reachable/i.test(e?.message ?? '')) throw e;
             // admin toggle — 'off' means surface the honest region-lock error
             if (getSetting('appleFallback') === 'off') throw e;
-            const fb = await appleCrossPlatformFallback(spec, ctx);
+            const fb = fbDepth === 0 ? await crossPlatformFallback(spec, ctx, ['qobuz', 'deezer', 'tidal']) : null;
             if (fb) return fb;
             throw e;
         }
@@ -289,15 +318,20 @@ export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buf
     throw new Error(`unsupported source: ${source}`);
 }
 
-// Region-locked Apple tracks: the same recording usually exists on the other
-// providers — re-resolve it there (ISRC first, else title+duration+artist) so a
-// storefront lock doesn't mean "no download".
-async function appleCrossPlatformFallback(spec: DownloadSpec, ctx: RequestContext): Promise<{ data: Buffer; format: string } | null> {
-    const order: ('qobuz' | 'deezer' | 'tidal')[] = ['qobuz', 'deezer', 'tidal'];
+// When a provider can't serve the real audio (region lock, entitlement wall,
+// preview-only tier), the same recording usually exists on the other platforms —
+// re-resolve it there (ISRC first, else title+duration+artist) so a blocked
+// provider doesn't mean "no download".
+async function crossPlatformFallback(
+    spec: DownloadSpec,
+    ctx: RequestContext,
+    order: PlatformSource[] = ['qobuz', 'deezer', 'tidal']
+): Promise<{ data: Buffer; format: string } | null> {
+    const sources = order.filter((s) => s !== spec.source && s !== 'apple' && s !== 'spotify');
     const wantTitle = (spec.title ?? '').trim().toLowerCase();
     const wantArtist = (spec.artist ?? '').split(/[,&]/)[0].trim().toLowerCase();
-    console.log(`[apple-fallback] resolving "${spec.title}" — ${spec.artist} (isrc=${spec.isrc ?? 'none'}, dur=${spec.duration ?? '?'}s)`);
-    for (const src of order) {
+    console.log(`[xplat-fallback] resolving "${spec.title}" — ${spec.artist} (isrc=${spec.isrc ?? 'none'}, dur=${spec.duration ?? '?'}s)`);
+    for (const src of sources) {
         try {
             // ISRC is the universal join key; text search is the fallback (some
             // providers don't index raw ISRCs in their search endpoint). Don't
@@ -330,23 +364,23 @@ async function appleCrossPlatformFallback(spec: DownloadSpec, ctx: RequestContex
                 });
             }
             if (!match) {
-                console.log(`[apple-fallback] ${src}: ${items.length} candidates, none matched title/artist/duration`);
+                console.log(`[xplat-fallback] ${src}: ${items.length} candidates, none matched title/artist/duration`);
                 continue;
             }
-            console.log(`[apple-fallback] "${spec.title}" not on the apple storefront — resolved on ${src} (id ${match.id})`);
-            const out = await produceTrackBytes({ ...spec, source: src, id: String(match.id) });
+            console.log(`[xplat-fallback] "${spec.title}" not servable by ${spec.source} — resolved on ${src} (id ${match.id})`);
+            const out = await produceTrackBytes({ ...spec, source: src, id: String(match.id), __fb: 1 } as DownloadSpec);
             // a provider under an unentitled account returns a ~30s preview —
             // reject it and try the next source rather than ship a sample
             if (spec.duration) {
                 const got = await probeDuration(out.data);
                 if (got > 0 && got < spec.duration * 0.6) {
-                    console.log(`[apple-fallback] ${src} produced a ${Math.round(got)}s preview for a ${spec.duration}s track — trying next source`);
+                    console.log(`[xplat-fallback] ${src} produced a ${Math.round(got)}s preview for a ${spec.duration}s track — trying next source`);
                     continue;
                 }
             }
             return out;
         } catch (e: any) {
-            console.log(`[apple-fallback] ${src} failed: ${e?.message?.slice(0, 120) ?? e}`);
+            console.log(`[xplat-fallback] ${src} failed: ${e?.message?.slice(0, 120) ?? e}`);
             continue;
         }
     }

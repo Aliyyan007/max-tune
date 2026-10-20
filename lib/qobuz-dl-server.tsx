@@ -158,7 +158,7 @@ export async function getAlbumInfo(album_id: string, options?: APIOptionProps) {
     return response.data;
 }
 
-export async function getDownloadURL(trackID: number, quality: string, options?: APIOptionProps) {
+export async function getDownloadInfo(trackID: number, quality: string, options?: APIOptionProps) {
     testForRequirements();
     const { country, ...requestOptions } = options || {};
     const token = country ? getTokenForCountry(country) : getRandomToken();
@@ -194,5 +194,9 @@ export async function getDownloadURL(trackID: number, quality: string, options?:
         const msg = d?.status?.message ?? d?.message;
         throw new Error(`Qobuz: no stream URL for this account${codes.length ? ` (${codes.join(', ')})` : ''}${msg ? ` — ${msg}` : ''}`);
     }
-    return d.url;
+    return d;
+}
+
+export async function getDownloadURL(trackID: number, quality: string, options?: APIOptionProps) {
+    return (await getDownloadInfo(trackID, quality, options)).url;
 }
