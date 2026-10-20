@@ -610,7 +610,9 @@ export async function resolveAmazonStream(asin: string, quality: AmazonQuality, 
             throw e;
         }
     }
-    throw lastErr ?? new Error('Amazon account is not eligible for any stream tier');
+    throw new Error(
+        `Amazon account is not eligible for any stream tier (Max/Normal/Free all denied) — the linked account needs Amazon Music enabled (even the free tier). ${lastErr?.message?.slice(0, 120) ?? ''}`
+    );
 }
 
 export async function downloadAmazonNative(asin: string, quality: AmazonQuality, tokens: { amazonToken?: string }): Promise<NativeResult> {

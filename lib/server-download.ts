@@ -220,7 +220,7 @@ export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buf
         if (fbDepth === 0 && spec.duration) {
             const got = await probeDuration(out.data);
             if (got > 0 && got < spec.duration * 0.6) {
-                const fb = await crossPlatformFallback(spec, ctx, ['deezer', 'qobuz']);
+                const fb = await crossPlatformFallback(spec, ctx, ['deezer', 'spotify', 'qobuz']);
                 if (fb) return fb;
             }
         }
@@ -237,7 +237,7 @@ export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buf
         if (fbDepth === 0 && spec.duration && (info.sample === true || (info.restrictions ?? []).length > 0)) {
             const got = await probeDuration(data);
             if (got > 0 && got < spec.duration * 0.6) {
-                const fb = await crossPlatformFallback(spec, ctx, ['deezer', 'tidal']);
+                const fb = await crossPlatformFallback(spec, ctx, ['deezer', 'spotify', 'tidal']);
                 if (fb) return fb;
             }
         }
@@ -301,7 +301,7 @@ export async function produceTrackBytes(spec: DownloadSpec): Promise<{ data: Buf
             if (!/region-locked|not available in the account's storefront|amdl failed|wrapper-lite not reachable/i.test(e?.message ?? '')) throw e;
             // admin toggle — 'off' means surface the honest region-lock error
             if (getSetting('appleFallback') === 'off') throw e;
-            const fb = fbDepth === 0 ? await crossPlatformFallback(spec, ctx, ['qobuz', 'deezer', 'tidal']) : null;
+            const fb = fbDepth === 0 ? await crossPlatformFallback(spec, ctx, ['deezer', 'spotify', 'tidal', 'qobuz']) : null;
             if (fb) return fb;
             throw e;
         }
@@ -327,7 +327,7 @@ async function crossPlatformFallback(
     ctx: RequestContext,
     order: PlatformSource[] = ['qobuz', 'deezer', 'tidal']
 ): Promise<{ data: Buffer; format: string } | null> {
-    const sources = order.filter((s) => s !== spec.source && s !== 'apple' && s !== 'spotify');
+    const sources = order.filter((s) => s !== spec.source && s !== 'apple');
     const wantTitle = (spec.title ?? '').trim().toLowerCase();
     const wantArtist = (spec.artist ?? '').split(/[,&]/)[0].trim().toLowerCase();
     console.log(`[xplat-fallback] resolving "${spec.title}" — ${spec.artist} (isrc=${spec.isrc ?? 'none'}, dur=${spec.duration ?? '?'}s)`);
@@ -421,7 +421,7 @@ function runFfmpeg(args: string[], timeoutMs = 300000): Promise<void> {
 
 // ffprobe duration of a produced buffer — guards the fallback chain against
 // providers that silently return 30s previews instead of the full track.
-function probeDuration(buf: Buffer): Promise<number> {
+export function probeDuration(buf: Buffer): Promise<number> {
     return new Promise((resolve) => {
         const tmp = path.join(os.tmpdir(), `dur-${crypto.randomBytes(6).toString('hex')}.bin`);
         try {

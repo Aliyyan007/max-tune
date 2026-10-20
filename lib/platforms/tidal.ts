@@ -299,20 +299,22 @@ export async function getTidalSession(ctx: RequestContext): Promise<{ countryCod
             throw e;
         }
     }
-    if (expired) {
-        // Bearer died — mint a fresh one from the stored OAuth refresh token
-        const fresh = await refreshTidalToken();
-        if (fresh) {
-            ctx.tokens.tidalToken = fresh;
-            try {
-                const res = await axios.get(`${BASE}/sessions`, { headers: { authorization: `Bearer ${fresh}`, 'User-Agent': UA }, timeout: 15000 });
-                const session = { countryCode: res.data.countryCode ?? 'US', userId: res.data.userId, at: Date.now() };
-                sessionCache.set(fresh, session);
-                return session;
-            } catch {
-                // refresh produced a token the sessions endpoint rejected — fall through
-            }
+    // Whether tokens 401'd now or were already bad-listed from earlier failures,
+    // the stored OAuth refresh token can mint a replacement — always try it
+    // before giving up (it early-returns null when nothing is stored).
+    const fresh = await refreshTidalToken();
+    if (fresh) {
+        ctx.tokens.tidalToken = fresh;
+        try {
+            const res = await axios.get(`${BASE}/sessions`, { headers: { authorization: `Bearer ${fresh}`, 'User-Agent': UA }, timeout: 15000 });
+            const session = { countryCode: res.data.countryCode ?? 'US', userId: res.data.userId, at: Date.now() };
+            sessionCache.set(fresh, session);
+            return session;
+        } catch {
+            // refresh produced a token the sessions endpoint rejected — fall through
         }
+    }
+    if (expired) {
         throw new Error('Tidal token expired — reconnect via the admin panel (double-click the corner dot) → Connect Tidal, or paste a fresh Bearer');
     }
     throw new Error('Tidal returned no usable session — add a Bearer token in the admin panel (double-click the corner dot)');

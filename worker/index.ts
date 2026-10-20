@@ -11,7 +11,7 @@
 import http from 'http';
 import { dequeueJob, jobDone, jobGet, jobSet, queueEnabled } from '../lib/queue';
 import { cacheEnabled, cachePut, presignGet, cacheKeyFor, objectKey } from '../lib/download-cache';
-import { produceTrackBytes, tagAndEncode, type DownloadSpec } from '../lib/server-download';
+import { produceTrackBytes, tagAndEncode, probeDuration, type DownloadSpec } from '../lib/server-download';
 import { hydrateSessionsFromRedis } from '../lib/platforms/native-tools';
 
 // Render free tier only offers web services — the worker must bind a port or
@@ -46,7 +46,21 @@ async function runJob(id: string): Promise<void> {
     const { data: out, ext } = await tagAndEncode(data, format, spec);
     const filename = spec.filename.toLowerCase().endsWith(`.${ext}`) ? spec.filename : `${spec.filename}.${ext}`;
 
-    if (cacheEnabled()) {
+    // Never cache a preview-tier output — a 30s clip pinned under the SOURCE key
+    // would keep serving the sample even after credentials upgrade. Still deliver
+    // the file to this requester; just don't persist it.
+    let cacheable = true;
+    if (spec.duration) {
+        try {
+            const got = await probeDuration(out);
+            if (got > 0 && got < spec.duration * 0.6) {
+                cacheable = false;
+                console.log(`[worker] ${id.slice(0, 8)} preview-tier output (${Math.round(got)}s/${spec.duration}s) — not caching`);
+            }
+        } catch {}
+    }
+
+    if (cacheEnabled() && cacheable) {
         const key = objectKey(cacheKeyFor(spec), ext);
         await cachePut(key, out);
         await jobSet(id, {
