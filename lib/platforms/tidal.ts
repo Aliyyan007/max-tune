@@ -1,7 +1,7 @@
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
-import { pickToken, reportToken, tokensFor, getSetting, admin } from '@/lib/token-pool';
+import { pickToken, reportToken, tokensFor, getSettingShared, admin } from '@/lib/token-pool';
 import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, QualityId, RequestContext } from './types';
 import type { FetchedQobuzAlbum, QobuzAlbum, QobuzTrack } from '@/lib/qobuz-dl';
@@ -217,6 +217,9 @@ function tidalSessionStore(fields: Record<string, string>) {
         try {
             admin.setSetting('tidalRefreshToken', fields.refresh_token);
         } catch {}
+        try {
+            import('../queue').then((q) => q.kvSet('setting:tidalRefreshToken', fields.refresh_token!));
+        } catch {}
         process.env.TIDAL_REFRESH_TOKEN = fields.refresh_token;
     }
     if (fields.access_token) {
@@ -231,7 +234,10 @@ export async function refreshTidalToken(): Promise<string | null> {
     tidalRefreshing ??= (async () => {
         try {
             const session = tidalSessionLoad();
-            const refreshToken = getSetting('tidalRefreshToken') || session?.refresh_token || process.env.TIDAL_REFRESH_TOKEN;
+            const refreshToken =
+                process.env.TIDAL_REFRESH_TOKEN ||
+                (await getSettingShared('tidalRefreshToken')) ||
+                session?.refresh_token;
             if (!refreshToken) return null;
             const res = await axios.post(
                 'https://auth.tidal.com/v1/oauth2/token',

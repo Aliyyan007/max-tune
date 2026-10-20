@@ -141,3 +141,18 @@ export async function cacheOldest(n: number): Promise<string[]> {
 export async function cacheIndexDel(key: string): Promise<void> {
     await cmd('ZREM', 'cache:index', key);
 }
+
+// ---------------- durable config KV ----------------
+// Render's filesystem is ephemeral and web/worker are separate machines — admin
+// settings + provider session material must live in Redis to survive restarts
+// and be visible to both processes. Local dev (no Redis) falls back to files.
+export async function kvSet(key: string, value: string): Promise<void> {
+    if (!queueEnabled()) return;
+    await cmd('SET', `cfg:${key}`, value);
+}
+
+export async function kvGet(key: string): Promise<string | null> {
+    if (!queueEnabled()) return null;
+    const v = await cmd('GET', `cfg:${key}`);
+    return v == null ? null : String(v);
+}

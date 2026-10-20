@@ -300,23 +300,28 @@ async function appleCrossPlatformFallback(spec: DownloadSpec, ctx: RequestContex
     for (const src of order) {
         try {
             // ISRC is the universal join key; text search is the fallback (some
-            // providers don't index raw ISRCs in their search endpoint)
+            // providers don't index raw ISRCs in their search endpoint). Don't
+            // stop at the first non-empty query — a fuzzy provider can return
+            // unrelated rows for an ISRC string; gather all candidates, then match.
             const queries = spec.isrc ? [spec.isrc, `${spec.title} ${spec.artist}`] : [`${spec.title} ${spec.artist}`];
-            let items: any[] = [];
+            const items: any[] = [];
             for (const q of queries) {
-                const res = await adapters[src].search(q, 8, 0, ctx);
-                items = (res as any)?.tracks?.items ?? [];
-                if (items.length) break;
+                try {
+                    const res = await adapters[src].search(q, 8, 0, ctx);
+                    for (const it of (res as any)?.tracks?.items ?? []) if (!items.includes(it)) items.push(it);
+                } catch {}
             }
+            const normTitle = (s: string) => s.toLowerCase().replace(/\s*[\(\[][^)\]]*(version|edit|remix|feat\.?|featuring|live|mono|stereo|remaster)[^)\]]*[\)\]]/g, '').trim();
+            const wantNorm = normTitle(spec.title ?? '');
             let match: any = null;
             if (spec.isrc) match = items.find((t) => String(t.isrc ?? '').toLowerCase() === spec.isrc!.toLowerCase());
             if (!match) {
                 match = items.find((t) => {
                     const name = String(t.title ?? '').trim().toLowerCase();
-                    const perf = String(t.performer?.name ?? t.artist?.name ?? '').toLowerCase();
+                    const perf = String(t.performer?.name ?? t.artist?.name ?? t.artists?.[0]?.name ?? '').toLowerCase();
                     const dur = Number(t.duration) || 0;
-                    if (wantTitle && name !== wantTitle) return false;
-                    if (spec.duration && dur && Math.abs(dur - spec.duration) > 8) return false; // remixes/interludes diverge
+                    if (wantTitle && name !== wantTitle && normTitle(name) !== wantNorm) return false;
+                    if (spec.duration && dur && Math.abs(dur - spec.duration) > 12) return false; // remixes/interludes diverge
                     if (wantArtist && perf && !perf.includes(wantArtist) && !wantArtist.includes(perf)) return false;
                     return true;
                 });

@@ -186,5 +186,13 @@ export async function getDownloadURL(trackID: number, quality: string, options?:
         httpsAgent: proxyAgent,
         ...requestOptions
     });
-    return response.data.url;
+    const d = response.data;
+    if (!d?.url) {
+        // Free/restricted accounts get an error body or a restricted entry without
+        // a url — surface the entitlement reason instead of a bare "Invalid URL".
+        const codes = (d?.restrictions ?? []).map((r: any) => r?.code).filter(Boolean);
+        const msg = d?.status?.message ?? d?.message;
+        throw new Error(`Qobuz: no stream URL for this account${codes.length ? ` (${codes.join(', ')})` : ''}${msg ? ` — ${msg}` : ''}`);
+    }
+    return d.url;
 }

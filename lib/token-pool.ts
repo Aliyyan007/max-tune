@@ -76,7 +76,7 @@ export function getSetting(key: string): string | undefined {
 }
 
 /** Keys admin is allowed to set remotely. */
-export const SETTABLE_KEYS = new Set(['appleWrapperUrl', 'appleFallback']);
+export const SETTABLE_KEYS = new Set(['appleWrapperUrl', 'appleFallback', 'tidalRefreshToken']);
 
 export function setSetting(key: string, value: string) {
     if (!SETTABLE_KEYS.has(key)) throw new Error(`unknown setting ${key}`);
@@ -88,7 +88,21 @@ export function setSetting(key: string, value: string) {
         fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
         fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settingsStore.values, null, 2));
     } catch {}
+    // Durable + shared with the worker — Redis survives Render restarts and is
+    // visible to both processes (their disks are ephemeral and private).
+    import('./queue').then((q) => q.kvSet(`setting:${key}`, v)).catch(() => {});
     return { [key]: settingsStore.values[key] ?? null };
+}
+
+/** Async read that checks the shared Redis store first (set by the web process),
+ * then the local settings file — this is how the worker sees web-side changes. */
+export async function getSettingShared(key: string): Promise<string | undefined> {
+    try {
+        const { kvGet } = await import('./queue');
+        const v = await kvGet(`setting:${key}`);
+        if (v) return v;
+    } catch {}
+    return getSetting(key);
 }
 
 /** Round-robin pick of a healthy (non-disabled) token for a platform. */

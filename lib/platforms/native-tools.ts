@@ -553,19 +553,36 @@ export type AmazonQuality = 'Max' | 'Master' | 'High' | 'Normal' | 'Medium' | 'L
 
 // Resolve the chosen stream + its Widevine key — fails fast on ineligible accounts
 // before any bytes move. Exported for the streaming download path.
+const isAmazonIneligible = (e: any) => /not eligible|NOT_ELIGIBLE|EligibilityException|eligible/i.test(e?.message ?? '');
+
+// Resolve the chosen stream + its Widevine key. Amazon licenses carry the tier
+// entitlement — a Free/SD-only account gets CUSTOMER_NOT_ELIGIBLE on HD/UHD at
+// license time, so the ladder walks down until the account is actually served.
 export async function resolveAmazonStream(asin: string, quality: AmazonQuality, tokens: { amazonToken?: string }) {
     const token = pickToken('amazon') || tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN;
     if (!token) throw new Error('Amazon Music needs an account token — get one at amz.dezalty.com, then paste it in Settings → Service Tokens');
-    const q = quality === 'Master' ? 'Max' : quality;
-    const raw = await gwFetch<AmazonStream[] | { streams?: AmazonStream[] }>(`/tracks/${encodeURIComponent(asin)}/streams/${encodeURIComponent(q)}`, token);
-    const streamList = Array.isArray(raw) ? raw : raw.streams ?? [];
-    const picked = Array.isArray(streamList) && streamList.length ? pickAmazonStream(streamList, q) : (raw as any).stream ?? (raw as any);
-    if (!picked?.base_url) throw new Error('no usable Amazon stream for this track');
-    const pssh = picked.pssh;
-    if (!pssh) throw new Error('stream has no PSSH — unexpected unencrypted content');
-    const rid = /[?&]r=([0-9a-f-]+)/i.exec(picked.base_url ?? '')?.[1] ?? '';
-    const key = await amazonWidevineKey(pssh, token, rid, asin);
-    return { picked, key, token };
+    const ladder = [...new Set<AmazonQuality>([quality === 'Master' ? 'Max' : quality, 'Normal', 'Free', 'Low'])];
+    let lastErr: any = null;
+    for (const q of ladder) {
+        try {
+            const raw = await gwFetch<AmazonStream[] | { streams?: AmazonStream[] }>(`/tracks/${encodeURIComponent(asin)}/streams/${encodeURIComponent(q)}`, token);
+            const streamList = Array.isArray(raw) ? raw : raw.streams ?? [];
+            const picked = Array.isArray(streamList) && streamList.length ? pickAmazonStream(streamList, q) : (raw as any).stream ?? (raw as any);
+            if (!picked?.base_url) throw new Error('no usable Amazon stream for this track');
+            const pssh = picked.pssh;
+            if (!pssh) throw new Error('stream has no PSSH — unexpected unencrypted content');
+            const rid = /[?&]r=([0-9a-f-]+)/i.exec(picked.base_url ?? '')?.[1] ?? '';
+            const key = await amazonWidevineKey(pssh, token, rid, asin);
+            return { picked, key, token };
+        } catch (e: any) {
+            if (isAmazonIneligible(e)) {
+                lastErr = e;
+                continue; // account can't license this tier — try the next one down
+            }
+            throw e;
+        }
+    }
+    throw lastErr ?? new Error('Amazon account is not eligible for any stream tier');
 }
 
 export async function downloadAmazonNative(asin: string, quality: AmazonQuality, tokens: { amazonToken?: string }): Promise<NativeResult> {
