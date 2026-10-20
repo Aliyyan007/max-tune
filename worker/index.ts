@@ -46,22 +46,23 @@ async function runJob(id: string): Promise<void> {
     const { data: out, ext } = await tagAndEncode(data, format, spec);
     const filename = spec.filename.toLowerCase().endsWith(`.${ext}`) ? spec.filename : `${spec.filename}.${ext}`;
 
-    // Never cache a preview-tier output — a 30s clip pinned under the SOURCE key
-    // would keep serving the sample even after credentials upgrade. Still deliver
-    // the file to this requester; just don't persist it.
+    // Never let a preview-tier output occupy the cache key — a 30s clip pinned
+    // under SOURCE-27 would keep serving the sample even after credentials
+    // upgrade. Store it under pv/ instead: still delivered via presigned R2 URL,
+    // but cacheGet (t/… prefix) never returns it.
     let cacheable = true;
     if (spec.duration) {
         try {
             const got = await probeDuration(out);
             if (got > 0 && got < spec.duration * 0.6) {
                 cacheable = false;
-                console.log(`[worker] ${id.slice(0, 8)} preview-tier output (${Math.round(got)}s/${spec.duration}s) — not caching`);
+                console.log(`[worker] ${id.slice(0, 8)} preview-tier output (${Math.round(got)}s/${spec.duration}s) — storing under pv/`);
             }
         } catch {}
     }
 
-    if (cacheEnabled() && cacheable) {
-        const key = objectKey(cacheKeyFor(spec), ext);
+    if (cacheEnabled()) {
+        const key = objectKey(cacheable ? cacheKeyFor(spec) : cacheKeyFor(spec).replace(/^t\//, 'pv/'), ext);
         await cachePut(key, out);
         await jobSet(id, {
             stage: 'done', sent: out.length, at: Date.now(),

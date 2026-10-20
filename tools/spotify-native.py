@@ -14,11 +14,13 @@ import librespot.core
 from librespot.audio.decoders import AudioQuality, VorbisOnlyAudioQuality
 from librespot.metadata import TrackId
 
+# Older librespot releases lack LOSSLESS — fall back to VERY_HIGH so the module
+# still loads instead of dying at import time on an AttributeError.
 QUALITY_MAP = {
     'normal': AudioQuality.NORMAL,
     'high': AudioQuality.HIGH,
     'very_high': AudioQuality.VERY_HIGH,
-    'lossless': AudioQuality.LOSSLESS,
+    'lossless': getattr(AudioQuality, 'LOSSLESS', AudioQuality.VERY_HIGH),
 }
 
 
