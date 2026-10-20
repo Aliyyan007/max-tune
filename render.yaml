@@ -28,7 +28,7 @@ envVarGroups:
 
 services:
   - type: web
-    name: maxtune-web
+    name: max-tune
     runtime: node
     plan: free
     buildCommand: npm ci && npm run build
@@ -42,7 +42,7 @@ services:
         value: http://136.111.58.129:12340
 
   - type: worker
-    name: maxtune-worker
+    name: max-tune-worker
     runtime: node
     plan: free
     buildCommand: npm ci && npm run build:worker && bash tools/provision-worker.sh
