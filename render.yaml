@@ -41,7 +41,7 @@ services:
       - key: APPLE_WRAPPER_URL
         value: http://136.111.58.129:12340
 
-  - type: web
+  - type: worker
     name: maxtune-worker
     runtime: node
     plan: free
