@@ -754,7 +754,7 @@ async function rawProduce(source: string, trackId: string, spec: DownloadSpec, c
     if (source === 'amazon' || source === 'amazon-native') {
         const zQ = quality === '27' ? 'Max' : quality === '7' ? 'Master' : quality === '6' ? 'High' : 'Normal';
         const { picked, keyP } = await resolveAmazonStreams(trackId, zQ as any, { amazonToken: spec.tokens?.amazonToken });
-        // overlap: prime the first segment batch while the Widevine key resolves
+        // prime the first segment batch; the Widevine license was proven during resolution
         const ranges = amazonRanges(picked.segments);
         const it = (ranges.length > 1 ? amazonRangeGen(picked.base_url!, ranges) : singleGetGen(picked.base_url!))[Symbol.asyncIterator]();
         const first = it.next();

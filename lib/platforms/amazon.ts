@@ -1,5 +1,5 @@
 ﻿import axios from 'axios';
-import { pickToken, admin } from '@/lib/token-pool';
+import { pickToken, admin, hydrateTokenPoolFromRedis } from '@/lib/token-pool';
 import fs from 'fs';
 import path from 'path';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -40,19 +40,49 @@ async function getConfig(): Promise<AmazonConfig> {
 
 // ------------------ gateway (account token) ------------------
 
-const amazonToken = (ctx: RequestContext) => pickToken('amazon') || ctx.tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN || '';
+// The gateway JWT is itself a JWT with an `exp` claim. Validate it locally and
+// refresh shortly before expiry instead of waiting for every first request to fail.
+export function amazonTokenExpiring(token: string, withinMs = 5 * 60 * 1000): boolean {
+    try {
+        const part = token.split('.')[1];
+        if (!part) return false;
+        const payload = JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+        return typeof payload.exp === 'number' && payload.exp * 1000 < Date.now() + withinMs;
+    } catch {
+        return false;
+    }
+}
+
+const candidateAmazonToken = (ctx?: RequestContext) => pickToken('amazon') || ctx?.tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN || '';
+
+export async function amazonToken(ctx?: RequestContext): Promise<string> {
+    const candidate = candidateAmazonToken(ctx);
+    if (!candidate) return '';
+    if (!amazonTokenExpiring(candidate)) return candidate;
+    // Another Render process may already have refreshed this credential. The
+    // worker mirrors its pool into Redis, so pull that shared copy before
+    // spending another gateway login round-trip here.
+    await hydrateTokenPoolFromRedis().catch(() => false);
+    const shared = candidateAmazonToken(ctx);
+    if (shared && !amazonTokenExpiring(shared)) return shared;
+    return (await refreshAmazonToken(shared || candidate)) ?? candidate;
+}
 
 // The JWT caps at 30d, but the exported website cookies live for months — store the
-// session export once (data/amazon-session.json) and re-mint fresh JWTs on 401s.
+// session export once (data/amazon-session.json) and re-mint fresh JWTs on auth failures.
 const SESSION_FILE = path.join(process.cwd(), 'data', 'amazon-session.json');
 let refreshing: Promise<string | null> | null = null;
 
-function storeToken(token: string) {
+function storeToken(token: string, staleToken?: string) {
     process.env.AMAZON_MUSIC_TOKEN = token;
     // The credential pool is mirrored to Redis, unlike process.env/.env which
     // are local to whichever web/worker process happened to refresh first.
     try {
         admin.add('amazon', token, 'auto-refresh');
+        // A refreshed token can already exist from another worker/process — make
+        // sure it is active, then stop rotating the expired credential it replaced.
+        admin.toggle('amazon', token, false);
+        if (staleToken && staleToken !== token) admin.toggle('amazon', staleToken, true);
     } catch {}
     try {
         const envPath = path.join(process.cwd(), '.env');
@@ -63,7 +93,7 @@ function storeToken(token: string) {
     } catch {}
 }
 
-export async function refreshAmazonToken(): Promise<string | null> {
+export async function refreshAmazonToken(staleToken?: string): Promise<string | null> {
     refreshing ??= (async () => {
         try {
             // env first (hosted deploys ship the session as AMAZON_SESSION_JSON), then
@@ -87,7 +117,7 @@ export async function refreshAmazonToken(): Promise<string | null> {
             );
             const newToken = res.data?.data?.access_token ?? res.data?.access_token ?? res.data?.token;
             if (!newToken) return null;
-            storeToken(String(newToken));
+            storeToken(String(newToken), staleToken);
             return String(newToken);
         } catch {
             return null;
@@ -133,12 +163,17 @@ async function gwGet(path: string, params: Record<string, any>, token: string, r
         return d?.data ?? d; // gateway wraps payloads in {data: ...}
     } catch (e: any) {
         const status = e?.response?.status;
-        if ((status === 401 || status === 422) && !retried) {
-            const fresh = await refreshAmazonToken();
+        const detail = `${e?.response?.data?.detail?.code ?? ''} ${e?.response?.data?.detail?.message ?? ''}`;
+        // Some gateway deployments report an expired/invalid session as 403 rather
+        // than 401. Refresh once for every auth-class response; if the retry still
+        // returns 403, the remaining explanation is entitlement, not staleness.
+        if ((status === 401 || status === 422 || status === 403) && !retried) {
+            const fresh = await refreshAmazonToken(token);
             if (fresh && fresh !== token) return gwGet(path, params, fresh, true);
+        }
+        if (status === 401 || status === 422 || /session_(expired|invalid)|token.*(expired|invalid)/i.test(detail)) {
             throw new Error('Amazon token expired — get a fresh session JWT at amz.dezalty.com');
         }
-        if (status === 401 || status === 422) throw new Error('Amazon token expired — get a fresh session JWT at amz.dezalty.com');
         if (status === 403) throw new Error('Amazon rejected this token — the linked account needs Amazon Music Unlimited');
         throw new Error(`Amazon gateway error ${status ?? ''}: ${e?.response?.data?.detail?.message ?? e?.message ?? 'unknown'}`);
     }
@@ -417,7 +452,7 @@ export const amazonAdapter: PlatformAdapter = {
 
     async search(query, limit, offset, ctx) {
         const results = emptyResults(query);
-        const token = amazonToken(ctx);
+        const token = await amazonToken(ctx);
         if (token) {
             // account-backed catalog â€” full Amazon view incl. albums & artists
             const [tracks, albums, artists] = await Promise.allSettled([
@@ -458,7 +493,7 @@ export const amazonAdapter: PlatformAdapter = {
     },
 
     async getAlbumInfo(albumId, ctx) {
-        const token = amazonToken(ctx);
+        const token = await amazonToken(ctx);
         if (!token) throw new Error('Amazon album details need an account token (Settings â†’ Service Tokens â†’ amz.dezalty.com)');
         const data = await gwGet(`/albums/${encodeURIComponent(albumId)}`, {}, token);
         // Gateway album detail: {asin, title, image, artist{name,asin}, explicit, genre, tracks[]}
@@ -486,7 +521,7 @@ export const amazonAdapter: PlatformAdapter = {
     },
 
     async getArtist(artistId, ctx, artistName) {
-        const token = amazonToken(ctx);
+        const token = await amazonToken(ctx);
         const out = emptyArtistResults();
         out.id = artistId;
         if (!token) {
@@ -537,7 +572,7 @@ export const amazonAdapter: PlatformAdapter = {
     },
 
     async getDownloadURL(trackId, quality, ctx, hint?: DownloadHint): Promise<DownloadInfo> {
-        const token = amazonToken(ctx);
+        const token = await amazonToken(ctx);
         if (!token) throw new Error('Amazon Music requires an account token â€” get one at amz.dezalty.com (log in with your Amazon account), then paste it in Settings â†’ Service Tokens');
         const params = new URLSearchParams({ source: 'amazon-native', id: trackId, quality, title: hint?.title ?? '', artist: hint?.artist ?? '' });
         if (hint?.duration) params.set('dur', String(hint.duration));

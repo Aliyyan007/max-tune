@@ -198,9 +198,10 @@ export const createDownloadJob = async (
                             return resolve();
                         }
                         if (outcome?.isPreview) {
+                            const provider = source.charAt(0).toUpperCase() + source.slice(1);
                             toast({
                                 title: 'Preview downloaded',
-                                description: `${source} only authorizes a ${outcome.previewDuration ? `${Math.round(outcome.previewDuration)}s ` : ''}preview for this account. The filename is marked “(Preview)”.`
+                                description: `${provider} only authorizes a ${outcome.previewDuration ? `${Math.round(outcome.previewDuration)}s ` : ''}preview for this account. This is ${provider}'s own preview asset, not audio substituted from another platform; the filename is marked “(Preview)”.`
                             });
                         }
                         setStatusBar((prev) => ({ ...prev, progress: 100, description: 'Done — check your downloads' }));

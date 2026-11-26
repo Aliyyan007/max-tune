@@ -13,7 +13,7 @@ Fork of [Qobuz-DL](https://github.com/QobuzDL/Qobuz-DL) extended to six provider
 | **Deezer** | full metadata | ARL; paid accounts unlock higher formats | Deezer free accounts may serve provider-authorized 128 kbps MP3 where available |
 | **Spotify** | web-player/catalog metadata | connected Spotify session through the admin OAuth flow | full native audio depends on the connected account; when native access is unavailable, a provider-owned 30-second preview may be served only as a clearly labeled preview |
 | **Tidal** | public catalog metadata through OAuth client-credentials tokens (`TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET`, with a compatibility catalog-only fallback) | valid user session plus track entitlement/region availability | expired or missing user sessions cannot produce full audio; Tidal's own anonymous/web preview may be served as a clearly labeled preview |
-| **Amazon Music** | gateway metadata | Amazon session/token, Widevine device material, and track entitlement | unentitled/free-tier tracks fail explicitly |
+| **Amazon Music** | gateway metadata | Amazon session/token, Widevine device material, and track entitlement | expired gateway JWTs are refreshed from the stored Amazon session when possible; unentitled/free-tier tracks fail explicitly after license validation |
 | **Apple Music** | official catalog API | `wrapper-lite` plus an Apple media user token for an account with an active Apple Music subscription | if the native path is unavailable or fails terminally, the same-provider iTunes preview may be served as a clearly labeled preview; it is never represented as a full track |
 
 The downloader never substitutes audio from a different provider in strict download mode and never uses yt-dlp for platform audio.

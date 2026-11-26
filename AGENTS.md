@@ -158,7 +158,13 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
   the compatibility device client when unset). User bearer sessions are still
   required for playback. Genre is genuinely absent from Tidal's catalog API —
   don't fabricate.
-- **Amazon** — hosted gateway (`amz.dezalty.com`) + optional session JSON.
+- **Amazon** — hosted gateway (`amz.dezalty.com`) + optional mobile session JSON.
+  Gateway JWT expiry is detected locally; refresh uses the exported website
+  cookies, then the fresh credential is mirrored through the Redis-backed token
+  pool for web/worker sharing. Widevine licenses use the signed mobile
+  `getLicenseForPlaybackV2` path in `tools/amz-license.py` and are validated
+  before media bytes download. `CUSTOMER_NOT_ELIGIBLE`/`REQUEST_BLOCKED` are
+  honest plan or per-track availability failures, not token-refresh bugs.
   Track rows lack ISRC — honest gap.
 - **Downloads** — upstream byte fetches retry transient net errors
   (`axiosBuf` in server-download.ts: ECONNRESET/ETIMEDOUT/5xx, 3 tries). A CDN

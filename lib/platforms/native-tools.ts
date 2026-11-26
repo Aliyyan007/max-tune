@@ -921,12 +921,17 @@ async function gwFetch<T>(path: string, token: string, opts: { method?: string; 
         return (res.data?.data ?? res.data) as T;
     } catch (e: any) {
         const status = e?.response?.status;
-        if ((status === 401 || status === 422) && !retried) {
+        const detail = `${e?.response?.data?.detail?.code ?? ''} ${e?.response?.data?.detail?.message ?? ''}`;
+        // Auth failures occasionally surface as 403 on the gateway. Refresh once
+        // for all auth-class responses; repeated 403s then mean entitlement.
+        if ((status === 401 || status === 422 || status === 403) && !retried) {
             const { refreshAmazonToken } = await import('./amazon');
-            const fresh = await refreshAmazonToken();
+            const fresh = await refreshAmazonToken(token);
             if (fresh && fresh !== token) return gwFetch(path, fresh, opts, true);
         }
-        if (status === 401 || status === 422) throw new Error('Amazon token expired — get a fresh session JWT at amz.dezalty.com');
+        if (status === 401 || status === 422 || /session_(expired|invalid)|token.*(expired|invalid)/i.test(detail)) {
+            throw new Error('Amazon token expired — get a fresh session JWT at amz.dezalty.com');
+        }
         if (status === 503 && /wvd/i.test(JSON.stringify(e?.response?.data ?? ''))) {
             throw new Error('__GATEWAY_NO_WVD__');
         }
@@ -1012,6 +1017,9 @@ async function fetchAmazonStream(stream: AmazonStream, dest: string): Promise<nu
 
 // Resolve the Widevine content key: gateway first, then local pywidevine + user .wvd
 export async function amazonWidevineKey(pssh: string, token: string, rid = '', asin = ''): Promise<string> {
+    // Hosted workers receive the session export and device key as env vars; the
+    // Python license helper expects real files under data/.
+    materializeSessions();
     try {
         const res = await gwFetch<{ key?: string }>('/widevine/key', token, { method: 'POST', json: { pssh } });
         if (res?.key) return res.key;
@@ -1030,16 +1038,18 @@ export type AmazonQuality = 'Max' | 'Master' | 'High' | 'Normal' | 'Medium' | 'L
 
 // Resolve the chosen stream + its Widevine key — fails fast on ineligible accounts
 // before any bytes move. Exported for the streaming download path.
-const isAmazonIneligible = (e: any) => /not eligible|NOT_ELIGIBLE|EligibilityException|eligible/i.test(e?.message ?? '');
+const isAmazonIneligible = (e: any) => /CUSTOMER_NOT_ELIGIBLE|REQUEST_BLOCKED|customer is not eligible|not eligible|NOT_ELIGIBLE/i.test(e?.message ?? '');
 
 // Resolve the chosen stream + its Widevine key. Amazon licenses carry the tier
 // entitlement — a Free/SD-only account gets CUSTOMER_NOT_ELIGIBLE on HD/UHD at
 // license time, so the ladder walks down until the account is actually served.
-// Returns the key as a STARTED promise so callers can overlap the license
-// round-trip with the segment download.
+// The license must be proven here; the stream endpoint alone over-reports tiers
+// that Amazon later refuses to license.
 export async function resolveAmazonStreams(asin: string, quality: AmazonQuality, tokens: { amazonToken?: string }) {
-    const token = pickToken('amazon') || tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN;
+    let token = pickToken('amazon') || tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN;
     if (!token) throw new Error('Amazon Music needs an account token — get one at amz.dezalty.com, then paste it in Settings → Service Tokens');
+    const { amazonToken } = await import('./amazon');
+    token = (await amazonToken({ tokens })) || token;
     const ladder = [...new Set<AmazonQuality>([quality === 'Master' ? 'Max' : quality, 'Normal', 'Free', 'Low'])];
     let lastErr: any = null;
     for (const q of ladder) {
@@ -1051,9 +1061,8 @@ export async function resolveAmazonStreams(asin: string, quality: AmazonQuality,
             const pssh = picked.pssh;
             if (!pssh) throw new Error('stream has no PSSH — unexpected unencrypted content');
             const rid = /[?&]r=([0-9a-f-]+)/i.exec(picked.base_url ?? '')?.[1] ?? '';
-            const keyP = amazonWidevineKey(pssh, token, rid, asin);
-            void keyP.catch(() => {}); // mark handled; callers still see the rejection on await
-            return { picked, keyP, token };
+            const key = await amazonWidevineKey(pssh, token, rid, asin);
+            return { picked, keyP: Promise.resolve(key), token };
         } catch (e: any) {
             if (isAmazonIneligible(e)) {
                 lastErr = e;
@@ -1063,14 +1072,14 @@ export async function resolveAmazonStreams(asin: string, quality: AmazonQuality,
         }
     }
     throw new Error(
-        `Amazon account is not eligible for any stream tier (Max/Normal/Free all denied) — the linked account needs Amazon Music enabled (even the free tier). ${lastErr?.message?.slice(0, 120) ?? ''}`
+        `Amazon did not license any stream tier for this track (Max/Normal/Free all denied) — the linked account may need Amazon Music Unlimited, or this track may not be available on its current plan. ${lastErr?.message?.slice(0, 120) ?? ''}`
     );
 }
 
 export async function downloadAmazonNative(asin: string, quality: AmazonQuality, tokens: { amazonToken?: string }): Promise<NativeResult> {
     const { picked, keyP } = await resolveAmazonStreams(asin, quality, tokens);
 
-    // fetch encrypted bytes while the license round-trip resolves in parallel
+    // fetch encrypted bytes after the license round-trip has proven entitlement
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amz-'));
     const encPath = path.join(workDir, 'enc.mp4');
     try {
