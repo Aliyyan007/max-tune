@@ -1,122 +1,368 @@
-// Queue worker — polls the Upstash job queue, runs the same produce→tag pipeline
-// the web process uses, uploads the result to R2, and marks the job with a
-// presigned URL. The web's /api/download-file just waits for resultUrl and
-// redirects — so the whole transfer cost of downloads lands on this process,
-// never on the web dyno.
+// Queue worker — polls Upstash, produces artifacts to local temp files, verifies
+// them, uploads them to R2, and only then marks jobs complete. The web process
+// orchestrates and redirects; it never buffers or transcodes queue-mode media.
 //
 //   WORKER_CAPS=generic          poll only the generic queue
 //   WORKER_CAPS=generic,apple    also poll apple (needs APPLE_WRAPPER_URL reachable)
+//   WORKER_CONCURRENCY=1         jobs per worker process (scale workers horizontally)
 //
-// Bundled to worker.cjs via `npm run build:worker` — no runtime deps on next.
+// Bundled to worker.mjs via `npm run build:worker` — no runtime dependency on next.
 import http from 'http';
-import { dequeueJob, jobDone, jobGet, jobSet, queueEnabled } from '../lib/queue';
-import { cacheEnabled, cachePut, presignGet, cacheKeyFor, objectKey } from '../lib/download-cache';
-import { produceTrackBytes, tagAndEncode, probeDuration, type DownloadSpec } from '../lib/server-download';
+import https from 'https';
+import os from 'os';
+import fs from 'fs';
+import axios from 'axios';
+import {
+    dequeueJob, jobDone, jobGet, jobSet, queueEnabled, touchInflight, retryJob,
+    cancelRequested, QUEUE_APPLE, QUEUE_GENERIC, queueDepths, jobCounters, cmd, LEASE_MS, publicErrorMessage
+} from '../lib/queue';
+import { cacheEnabled, cachePutFile, presignGet, cacheKeyFor, previewCacheKeyFor, objectKey, zipCacheKeyFor, previewZipCacheKeyFor } from '../lib/download-cache';
+import { stageToFile, probeFileDuration, classifyDlError, pipelineSlots, artifactFilename, type DownloadSpec } from '../lib/server-download';
+import { produceAlbumZipFile, type AlbumZipSpec } from '../lib/album-zip-produce';
 import { hydrateSessionsFromRedis } from '../lib/platforms/native-tools';
+import { hydrateTokenPoolFromRedis, hydrateSettingsFromRedis } from '../lib/token-pool';
 
-// Render free tier only offers web services — the worker must bind a port or
-// the platform kills it after the port-scan timeout. This tiny listener doubles
-// as the health check + external-pinger target.
-const PORT = Number(process.env.PORT ?? 3101);
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, caps: CAPS, up: Math.floor(process.uptime()) }));
-}).listen(PORT, () => console.log(`[worker] health on :${PORT}`));
+// NOTE: the bundle never imports lib/platforms/index (the module that sets
+// axios keep-alive) — without this every upstream call pays a fresh TCP+TLS.
+axios.defaults.httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
+axios.defaults.httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
 
 const CAPS = (process.env.WORKER_CAPS ?? 'generic').split(',').map((s) => s.trim()).filter(Boolean);
+const QUEUES = [...(CAPS.includes('apple') ? [QUEUE_APPLE] : []), ...(CAPS.includes('generic') ? [QUEUE_GENERIC] : [])];
 const POLL_MS = Number(process.env.WORKER_POLL_MS ?? 2500);
+const CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY ?? 1));
+const MAX_ATTEMPTS = Math.max(1, Number(process.env.JOB_MAX_ATTEMPTS ?? 3));
+const INLINE_RESULT_MAX = 8 * 1024 * 1024;
+const WORKER_ID = `${os.hostname()}-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let stopping = false;
+let active = 0;
+const metrics = {
+    claimed: 0,
+    completed: 0,
+    failed: 0,
+    retried: 0,
+    cancelled: 0,
+    bytesProduced: 0,
+    lastError: '',
+    lastJobAt: 0
+};
 
-async function runJob(id: string): Promise<void> {
-    const job = await jobGet(id);
-    if (!job?.spec) {
-        await jobSet(id, { stage: 'error', error: 'job payload missing' });
-        return;
-    }
-    if (job.cancelled) {
-        await jobSet(id, { stage: 'error', error: 'cancelled' });
-        return;
-    }
-    const spec = JSON.parse(job.spec) as DownloadSpec;
-    console.log(`[worker] ${id.slice(0, 8)} ${spec.source} ${spec.title} — ${spec.artist}`);
-    await jobSet(id, { stage: 'resolving', at: Date.now() });
-    const { data, format } = await produceTrackBytes(spec);
-    await jobSet(id, { stage: 'processing', received: data.length, total: data.length });
-    const { data: out, ext } = await tagAndEncode(data, format, spec);
-    const filename = spec.filename.toLowerCase().endsWith(`.${ext}`) ? spec.filename : `${spec.filename}.${ext}`;
-
-    // Never let a preview-tier output occupy the cache key — a 30s clip pinned
-    // under SOURCE-27 would keep serving the sample even after credentials
-    // upgrade. Store it under pv/ instead: still delivered via presigned R2 URL,
-    // but cacheGet (t/… prefix) never returns it.
-    let cacheable = true;
-    if (spec.duration) {
+// Terminal-state writes must survive transient Redis blips — otherwise a job
+// remains leased as processing and users see a false "stuck" download.
+async function finishJob(id: string, ok: boolean, patch: Record<string, any>, token: string, tries = 6): Promise<void> {
+    let lastErr: any;
+    for (let i = 0; i < tries; i++) {
         try {
-            const got = await probeDuration(out);
-            if (got > 0 && got < spec.duration * 0.6) {
-                cacheable = false;
-                console.log(`[worker] ${id.slice(0, 8)} preview-tier output (${Math.round(got)}s/${spec.duration}s) — storing under pv/`);
+            await jobDone(id, ok, patch, token);
+            return;
+        } catch (e: any) {
+            lastErr = e;
+            if (/lease lost/i.test(String(e?.message ?? e))) break;
+            await sleep(1000 * (i + 1));
+        }
+    }
+    console.error(`[worker] ${id.slice(0, 8)} terminal write failed: ${lastErr?.message ?? lastErr}`);
+}
+
+function retriableFailure(e: any): boolean {
+    const kind = classifyDlError(e);
+    const msg = `${e?.message ?? e} ${e?.code ?? ''}`;
+    if (/cancelled|abort/i.test(msg)) return false;
+    if (kind === 'network') return true;
+    if (kind === 'tool' && /ffmpeg timed out|timed out|spawn|enoent|socket|econnreset|epipe/i.test(msg)) return true;
+    return /r2 put|verification failed|fetch failed|ECONNRESET|ETIMEDOUT|ENETRESET|EPIPE|429|5\d\d/i.test(msg);
+}
+
+function validateTrackSpec(spec: any): asserts spec is DownloadSpec {
+    if (!spec || typeof spec !== 'object') throw new Error('invalid job payload');
+    if (!spec.source || !spec.id || !spec.filename) throw new Error('job payload missing source/id/filename');
+    if (typeof spec.title !== 'string' || typeof spec.artist !== 'string') throw new Error('job payload missing track metadata');
+}
+
+function validateZipSpec(spec: any): asserts spec is AlbumZipSpec {
+    if (!spec || typeof spec !== 'object') throw new Error('invalid zip payload');
+    if (!spec.source || !spec.albumId || !spec.zipName) throw new Error('zip payload missing source/albumId/zipName');
+}
+
+async function uploadArtifact(args: {
+    id: string;
+    file: string;
+    ext: string;
+    filename: string;
+    cacheKey: string;
+    extra?: Record<string, any>;
+}): Promise<Record<string, any>> {
+    const size = fs.statSync(args.file).size;
+    if (!size) throw new Error('produced artifact is empty');
+    if (cacheEnabled()) {
+        const key = objectKey(args.cacheKey, args.ext);
+        await jobSet(args.id, { stage: 'processing', label: 'Uploading artifact', total: size }).catch(() => {});
+        const uploaded = await cachePutFile(key, args.file, size);
+        return {
+            sent: size,
+            total: size,
+            resultUrl: presignGet(key, args.filename, 6 * 3600),
+            resultExt: args.ext,
+            resultName: args.filename,
+            resultJson: {
+                objectKey: key,
+                size: uploaded.size,
+                sha256: uploaded.sha256,
+                etag: uploaded.etag,
+                ...args.extra
             }
-        } catch {}
+        };
     }
 
-    if (cacheEnabled()) {
-        const key = objectKey(cacheable ? cacheKeyFor(spec) : cacheKeyFor(spec).replace(/^t\//, 'pv/'), ext);
-        await cachePut(key, out);
-        await jobSet(id, {
-            stage: 'done', sent: out.length, at: Date.now(),
-            resultUrl: presignGet(key, filename, 6 * 3600), resultExt: ext, resultName: filename
-        });
-        console.log(`[worker] ${id.slice(0, 8)} done → r2 ${key} (${out.length}B)`);
-    } else {
-        // no bucket configured — stash bytes on the job directly (small tracks only;
-        // redis value limit is 100MB but Upstash free tier is far tighter)
-        if (out.length > 8 * 1024 * 1024) {
-            await jobSet(id, { stage: 'error', error: 'R2 bucket not configured — cannot deliver >8MB result' });
-            return;
+    // Development fallback only. Redis inline values are deliberately capped;
+    // production must configure R2 rather than pushing media through the broker.
+    if (process.env.NODE_ENV === 'production' && process.env.ALLOW_INLINE_RESULTS !== '1') {
+        throw new Error('R2 artifact storage is required in production queue mode');
+    }
+    if (size > INLINE_RESULT_MAX) throw new Error('R2 bucket not configured — cannot deliver >8MB result');
+    const buf = fs.readFileSync(args.file);
+    return {
+        sent: size,
+        total: size,
+        resultB64: buf.toString('base64'),
+        resultExt: args.ext,
+        resultName: args.filename,
+        resultJson: { size, inline: true, ...args.extra }
+    };
+}
+
+async function processTrack(id: string, spec: DownloadSpec, signal: AbortSignal): Promise<Record<string, any>> {
+    validateTrackSpec(spec);
+    await jobSet(id, { stage: 'resolving', label: `${spec.title} — ${spec.artist}` }).catch(() => {});
+    const release = await pipelineSlots.acquire();
+    let staged: Awaited<ReturnType<typeof stageToFile>> | null = null;
+    try {
+        staged = await stageToFile(spec, id, signal);
+    } finally {
+        release();
+    }
+    try {
+        if (!fs.existsSync(staged.file) || fs.statSync(staged.file).size !== staged.size || staged.size <= 0) {
+            throw new Error('produced track artifact failed size validation');
         }
-        await jobSet(id, {
-            stage: 'done', sent: out.length, at: Date.now(),
-            resultB64: out.toString('base64'), resultExt: ext, resultName: filename
-        } as any);
-        console.log(`[worker] ${id.slice(0, 8)} done → inline (${out.length}B)`);
+
+        // Explicit provider previews are legitimate degraded artifacts. Hidden
+        // short files are still rejected — only a resolver that proved and
+        // labeled the provider-owned preview may take this path.
+        const gotDuration = await probeFileDuration(staged.file);
+        if (gotDuration <= 0) throw new Error('produced track artifact is not a valid/audio-parseable media file');
+        if (!staged.isPreview && spec.duration && gotDuration < spec.duration * 0.6) {
+            throw new Error(`${spec.source} only served a ${Math.round(gotDuration)}s clip of a ${spec.duration}s track — refusing to deliver`);
+        }
+
+        const filename = artifactFilename(spec.filename, staged.ext, staged.isPreview);
+        return await uploadArtifact({
+            id,
+            file: staged.file,
+            ext: staged.ext,
+            filename,
+            // Preview artifacts are deliverable but deliberately non-reusable:
+            // keying them by job id prevents a free-tier artifact from becoming
+            // a stale cache hit after the account later gains entitlement.
+            cacheKey: staged.isPreview ? `${previewCacheKeyFor(spec)}/job-${id}` : cacheKeyFor(spec),
+            extra: {
+                kind: 'track',
+                source: spec.source,
+                trackId: spec.id,
+                servedBy: staged.servedBy,
+                isPreview: !!staged.isPreview,
+                previewDuration: staged.isPreview ? Math.round(gotDuration * 10) / 10 : undefined
+            }
+        });
+    } finally {
+        fs.rmSync(staged.dir, { recursive: true, force: true });
     }
 }
+
+async function processZip(id: string, spec: AlbumZipSpec, isCancelled: () => boolean): Promise<Record<string, any>> {
+    validateZipSpec(spec);
+    const produced = await produceAlbumZipFile(spec, id, isCancelled);
+    try {
+        const zipName = spec.zipName.toLowerCase().endsWith('.zip') ? spec.zipName : `${spec.zipName}.zip`;
+        return await uploadArtifact({
+            id,
+            file: produced.file,
+            ext: 'zip',
+            filename: zipName,
+            cacheKey: produced.previewCount ? `${previewZipCacheKeyFor(spec)}/job-${id}` : zipCacheKeyFor(spec),
+            extra: { kind: 'zip', source: spec.source, albumId: spec.albumId, trackCount: produced.trackCount, failedCount: produced.failedCount, previewCount: produced.previewCount, containsPreviews: produced.previewCount > 0 }
+        });
+    } finally {
+        fs.rmSync(produced.dir, { recursive: true, force: true });
+    }
+}
+
+async function processClaim(claim: NonNullable<Awaited<ReturnType<typeof dequeueJob>>>): Promise<void> {
+    const { id, payload, kind, attempt, token } = claim;
+    metrics.claimed++;
+    metrics.lastJobAt = Date.now();
+    const short = id.slice(0, 8);
+    const ac = new AbortController();
+    let sawCancel = false;
+    const cancelPoll = setInterval(() => {
+        jobGet(id)
+            .then((j) => {
+                if (cancelRequested(j)) {
+                    sawCancel = true;
+                    ac.abort();
+                }
+            })
+            .catch(() => {});
+    }, 2000);
+    const hb = setInterval(() => {
+        touchInflight(id, WORKER_ID, LEASE_MS, token).then((ok) => {
+            // If the lease was lost, another worker may legitimately own the job
+            // now. Abort local work instead of racing a duplicate terminal write.
+            if (!ok) ac.abort();
+        }).catch(() => {});
+    }, Math.max(10_000, Math.floor(LEASE_MS / 4)));
+
+    try {
+        console.log(`[worker] ${short} ${kind} attempt=${attempt} ${payload?.source ?? ''} ${payload?.title ?? payload?.zipName ?? ''}`);
+        const result = kind === 'zip'
+            ? await processZip(id, payload, () => sawCancel)
+            : await processTrack(id, payload as DownloadSpec, ac.signal);
+        if (sawCancel || ac.signal.aborted) throw new Error('cancelled');
+        await finishJob(id, true, result, token);
+        metrics.completed++;
+        metrics.bytesProduced += Number(result.sent ?? 0);
+        console.log(`[worker] ${short} done (${result.sent ?? 0}B)`);
+    } catch (e: any) {
+        const msg = String(e?.message ?? e).slice(0, 500);
+        const cancelled = sawCancel || /cancelled/i.test(msg);
+        if (cancelled) {
+            metrics.cancelled++;
+            await finishJob(id, false, { error: 'cancelled', errorKind: 'cancelled' }, token);
+            console.log(`[worker] ${short} cancelled`);
+        } else if (attempt < MAX_ATTEMPTS && retriableFailure(e)) {
+            metrics.retried++;
+            const backoff = Math.min(30_000, 2000 * 2 ** Math.max(0, attempt - 1));
+            await retryJob(id, msg, backoff, token).catch(async () => {
+                await finishJob(id, false, { error: msg, errorKind: classifyDlError(e) }, token);
+            });
+            console.log(`[worker] ${short} retrying in ${backoff}ms: ${msg.slice(0, 160)}`);
+        } else {
+            metrics.failed++;
+            metrics.lastError = publicErrorMessage(msg) ?? '';
+            const errorKind = classifyDlError(e);
+            await finishJob(id, false, { error: msg, errorKind }, token);
+            console.log(`[worker] ${short} failed (${errorKind}): ${msg.slice(0, 200)}`);
+        }
+    } finally {
+        clearInterval(cancelPoll);
+        clearInterval(hb);
+    }
+}
+
+async function workerRegistryHeartbeat() {
+    await cmd('HSET', 'workers', WORKER_ID, JSON.stringify({
+        id: WORKER_ID,
+        host: os.hostname(),
+        pid: process.pid,
+        caps: CAPS,
+        active,
+        concurrency: CONCURRENCY,
+        uptime: Math.floor(process.uptime()),
+        metrics,
+        at: Date.now()
+    })).catch(() => {});
+}
+
+// Render free tier only offers web services — the worker must bind a port or
+// the platform kills it after the port-scan timeout. The listener doubles as
+// liveness/readiness/metrics for operators and external pingers.
+const PORT = Number(process.env.PORT ?? 3101);
+const server = http.createServer(async (req, res) => {
+    try {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        if (url.pathname === '/metrics') {
+            const [depths, counters] = await Promise.all([queueDepths().catch(() => ({})), jobCounters().catch(() => ({}))]);
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ ok: true, worker: WORKER_ID, caps: CAPS, active, concurrency: CONCURRENCY, up: Math.floor(process.uptime()), metrics, queue: depths, counters }));
+            return;
+        }
+        if (url.pathname === '/ready') {
+            const ok = queueEnabled() && QUEUES.length > 0 && !stopping;
+            res.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ ok, queueEnabled: queueEnabled(), queues: QUEUES, cache: cacheEnabled() ? 'r2' : 'inline-dev' }));
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, worker: WORKER_ID, caps: CAPS, active, up: Math.floor(process.uptime()) }));
+    } catch (e: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e?.message ?? 'worker health error' }));
+    }
+});
 
 async function main() {
     if (!queueEnabled()) {
         console.error('UPSTASH_REDIS_URL/UPSTASH_REDIS_TOKEN not set — worker cannot start');
         process.exit(1);
     }
+    if (!QUEUES.length) {
+        console.error(`WORKER_CAPS=${CAPS.join(',')} does not include generic or apple`);
+        process.exit(1);
+    }
+    server.listen(PORT, () => console.log(`[worker] health on :${PORT}`));
     // Pull provider sessions written by the web process's connect flows — the
     // two disks don't share storage, Redis is the bridge.
     await hydrateSessionsFromRedis().catch(() => {});
-    console.log(`[worker] up — caps=${CAPS.join('+')} cache=${cacheEnabled() ? 'r2' : 'inline'}`);
+    await hydrateTokenPoolFromRedis().catch(() => false);
+    await hydrateSettingsFromRedis().catch(() => false);
+    setInterval(() => {
+        hydrateTokenPoolFromRedis().catch(() => false);
+        hydrateSettingsFromRedis().catch(() => false);
+    }, 30_000).unref();
+    await workerRegistryHeartbeat();
+    setInterval(workerRegistryHeartbeat, 15_000).unref();
+    console.log(`[worker] up — id=${WORKER_ID} caps=${CAPS.join('+')} queues=${QUEUES.join('+')} concurrency=${CONCURRENCY} cache=${cacheEnabled() ? 'r2' : 'inline-dev'}`);
+
     let idle = 0;
-    for (;;) {
+    while (!stopping) {
         try {
-            const id = await dequeueJob(CAPS);
-            if (!id) {
+            if (active >= CONCURRENCY) {
+                await sleep(150);
+                continue;
+            }
+            const claim = await dequeueJob(QUEUES, WORKER_ID, LEASE_MS);
+            if (!claim) {
                 idle++;
-                // exponential-ish backoff: 2.5s → max 30s when starving
-                await sleep(Math.min(POLL_MS * Math.ceil(idle / 8), 30000));
+                await sleep(Math.min(POLL_MS * Math.ceil(idle / 8), 30_000));
                 continue;
             }
             idle = 0;
-            try {
-                await runJob(id);
-            } catch (e: any) {
-                console.log(`[worker] ${id.slice(0, 8)} failed: ${e?.message?.slice(0, 200) ?? e}`);
-                await jobSet(id, { stage: 'error', error: String(e?.message ?? e).slice(0, 500), at: Date.now() }).catch(() => {});
-            } finally {
-                await jobDone(id).catch(() => {});
-            }
+            active++;
+            void processClaim(claim).finally(() => active--);
         } catch (e: any) {
-            console.log(`[worker] poll error: ${e?.message?.slice(0, 160) ?? e}`);
+            metrics.lastError = publicErrorMessage(String(e?.message ?? e)) ?? '';
+            console.log(`[worker] poll error: ${metrics.lastError}${e?.cause?.code ? ` cause=${e.cause.code}` : ''}`);
             await sleep(5000);
         }
     }
+
+    const drainDeadline = Date.now() + 30_000;
+    while (active && Date.now() < drainDeadline) await sleep(250);
+    server.close();
+    console.log(`[worker] stopped — active=${active}`);
+    process.exit(active ? 1 : 0);
 }
 
-main();
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(sig, () => {
+        if (!stopping) console.log(`[worker] ${sig} received — draining`);
+        stopping = true;
+    });
+}
+
+main().catch((e) => {
+    console.error(`[worker] fatal: ${e?.message ?? e}`);
+    process.exit(1);
+});

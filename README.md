@@ -1,133 +1,156 @@
 # MaxTune — multi-platform music downloader
 
-Fork of [Qobuz-DL](https://github.com/QobuzDL/Qobuz-DL) extended to six providers behind one adapter layer, all normalized into the same UI/metadata model.
+Fork of [Qobuz-DL](https://github.com/QobuzDL/Qobuz-DL) extended to six providers behind one adapter layer, normalized into the same UI and metadata model.
 
 > [!IMPORTANT]
-> This repository does not contain any copyrighted material, or code to illegaly download music. Downloads are provided by provider APIs and should only be initiated by the token/account owner. The author is **not responsible for the usage of this repository nor endorses it**.
+> This repository does not contain copyrighted material. Downloads use provider-controlled delivery paths and must only be initiated by the account/token owner for content that account is entitled to access. The project does not bypass entitlement, region, or subscription restrictions.
 
-## Platforms
+## Platform support and honest account-tier behavior
 
-| Provider | Metadata | Downloads |
-|---|---|---|
-| **Qobuz** | full | lossless (account token) |
-| **Deezer** | full | 128k MP3 free tier · FLAC with paid ARL |
-| **Spotify** | full (web-player gateway) | librespot session (OAuth via admin panel) |
-| **Tidal** | full | entitlement-gated — needs paid-tier token |
-| **Amazon** | via gateway | entitlement-gated — needs Unlimited session |
-| **Apple** | official catalog API | ALAC via `wrapper-lite` + media-user-token · 30s preview without |
+| Provider | Metadata | Full-audio requirement | Free/preview behavior |
+|---|---|---|---|
+| **Qobuz** | full catalog metadata | valid Qobuz account token with streaming entitlement | preview/unentitled responses fail explicitly |
+| **Deezer** | full metadata | ARL; paid accounts unlock higher formats | Deezer free accounts may serve provider-authorized 128 kbps MP3 where available |
+| **Spotify** | web-player/catalog metadata | connected Spotify session through the admin OAuth flow | full native audio depends on the connected account; when native access is unavailable, a provider-owned 30-second preview may be served only as a clearly labeled preview |
+| **Tidal** | public catalog metadata through OAuth client-credentials tokens (`TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET`, with a compatibility catalog-only fallback) | valid user session plus track entitlement/region availability | expired or missing user sessions cannot produce full audio; Tidal's own anonymous/web preview may be served as a clearly labeled preview |
+| **Amazon Music** | gateway metadata | Amazon session/token, Widevine device material, and track entitlement | unentitled/free-tier tracks fail explicitly |
+| **Apple Music** | official catalog API | `wrapper-lite` plus an Apple media user token for an account with an active Apple Music subscription | if the native path is unavailable or fails terminally, the same-provider iTunes preview may be served as a clearly labeled preview; it is never represented as a full track |
 
-## Features
+The downloader never substitutes audio from a different provider in strict download mode and never uses yt-dlp for platform audio.
 
-- Same Qobuz-shaped UI for every platform — search, artist/album pages, releases, artwork
-- Server-side downloads: resolve → decrypt → ffmpeg tag/art → browser stream
-- `SOURCE` codec (native format) is the default; transcode to FLAC/MP3/ALAC/etc on demand
-- Optional production layer: **Upstash queue** + **Cloudflare R2** cache (repeat downloads are instant and never re-hit providers)
+## Architecture
 
-## Production deploy (Render blueprint)
+- **Next.js web service** — UI, metadata/search APIs, request validation, job creation, status, cache-hit redirects.
+- **Redis/Upstash durable queue** — job state in hashes, atomic Lua claim/recovery, worker leases, delayed retries, cancellation, and capability queues (`generic`, `apple`).
+- **Download worker** — separate process/service. Produces audio to temporary files rather than buffering whole tracks in memory, validates duration/container/archive structure, uploads artifacts, and only then marks jobs complete.
+- **Cloudflare R2 artifact store** — streamed uploads, size/ETag verification, SHA-256 metadata, deterministic recipe cache keys, LRU accounting, and presigned browser delivery.
+- **Album ZIP jobs** — use the same queue/worker/artifact path as single tracks. Archives are written incrementally to disk with valid ZIP central directories and CRCs.
+- **Observability** — `/api/health`, `/api/ready`, `/api/metrics`, `/api/platform-health`, worker `/`, `/ready`, `/metrics`.
+- **Security posture** — no default admin password, admin rate limiting, optional AES-GCM encryption of Redis job payloads/shared credential state, no provider tokens in job-status responses.
 
-`render.yaml` defines two free-tier services + one shared env group (`maxtune-shared`):
+Queue mode is enabled when `UPSTASH_REDIS_URL` and `UPSTASH_REDIS_TOKEN` are configured. Without them the app retains the local in-process download path for development/single-user use. In production the legacy direct `/api/stream-audio` path is disabled by default (`ENABLE_LEGACY_STREAM_AUDIO=1` re-enables it deliberately), and request-supplied Apple wrapper URLs are ignored unless `ALLOW_USER_APPLE_WRAPPER=1` because arbitrary wrapper endpoints would otherwise create a blind-SSRF risk.
 
-- **`maxtune-web`** — the Next.js app (search/UI/API)
-- **`maxtune-worker`** — the download worker (`WORKER_CAPS=generic,apple`) — consumes the Redis queue, produces tagged audio, stores to R2
+## Production deployment (Render blueprint)
 
-Secrets needed in the shared group: `UPSTASH_REDIS_URL/TOKEN`, `R2_ENDPOINT/BUCKET/ACCESS_KEY_ID/SECRET_ACCESS_KEY`, `APPLE_MEDIA_USER_TOKEN`, `DEEZER_ARL`, `QOBUZ_APP_ID/APP_SECRET`, `ADMIN_PASSWORD`.
+`render.yaml` defines:
 
-Without `UPSTASH_*` the app runs fully in-process — queue mode is optional.
+- **`max-tune`** — Next.js web service, health checked at `/api/health`.
+- **`max-tune-worker`** — worker service binding Render's required port, readiness endpoint at `/ready`, metrics at `/metrics`.
+- **`maxtune-shared`** — shared secret env group.
 
-### Apple Music wrapper (the one piece that needs "a machine")
+Required shared infrastructure secrets:
 
-`wrapper-lite` serves the decryption endpoints amdl calls. Host options:
+- `UPSTASH_REDIS_URL`, `UPSTASH_REDIS_TOKEN`
+- `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
+- `JOB_PAYLOAD_ENCRYPTION_KEY` — strong random secret
+- `ADMIN_PASSWORD` — strong unique password
 
-- **GCP always-free e2-micro** — Debian + QEMU TCG, 30GB disk, systemd service — the recipe is in `AGENTS.md`
-- **Any Linux box** — `wrapper-lite-rootless` (user namespaces, no QEMU, near-native speed)
-- **Windows PC** — `tools\wrapper\wrapper-lite-qemu.exe` (only while the machine is on)
-- **Skip it** — Apple falls back to the iTunes preview honestly
+Provider credentials are environment-specific: `QOBUZ_APP_ID`, `QOBUZ_SECRET`, `QOBUZ_AUTH_TOKENS`, `DEEZER_ARL`, `TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET` for public Tidal metadata plus `TIDAL_ACCESS_TOKEN`/`TIDAL_REFRESH_TOKEN` for playback, `SPOTIFY_SESSION_JSON`, `APPLE_MEDIA_USER_TOKEN`, `APPLE_WRAPPER_URL`, `AMAZON_MUSIC_TOKEN`/`AMAZON_SESSION_JSON`/`AMAZON_DEVICE_WVD_B64` as applicable.
 
-## Table of Contents
+Production queue mode requires R2. Redis-inline media results are a development fallback only (`ALLOW_INLINE_RESULTS=1`) and are deliberately disabled in production.
 
-- [Platforms](#platforms)
-- [Production deploy](#production-deploy-render-blueprint)
-- [Installation](#installation)
-- [Contributing](#contributing)
-- [License](#license)
+### Worker scaling
 
-## Installation
+Start with `WORKER_CONCURRENCY=1` on small hosts. Scale horizontally by adding worker instances before increasing concurrency. Use:
 
-Before you begin, ensure you have the following installed:
+- `WORKER_CAPS=generic` for normal workers.
+- `WORKER_CAPS=generic,apple` only where `APPLE_WRAPPER_URL` is reachable.
 
-- **Node.js** (LTS version recommended)  
-  Download from: [https://nodejs.org/](https://nodejs.org/)
+Workers heartbeat their leases. Crash recovery is automatic; transient network/tool failures retry with backoff. Where a provider legitimately exposes a same-provider preview, entitlement failure degrades to that labeled preview instead of a silent full-track fake; otherwise region/entitlement failures are terminal and explicit.
 
-- **npm** (comes with Node.js)  
-  To check if npm is installed, run:
-    ```bash
-    npm -v
-    ```
+## Apple Music wrapper
 
-## Getting Started
+`wrapper-lite` is the one component that needs an always-on machine. It is an unauthenticated decryption service, so restrict network access to trusted worker egress addresses.
 
-### 1. Clone the repo
+Options:
 
-```bash
-git clone https://github.com/QobuzDL/Qobuz-DL.git
-```
+- **GCP always-free e2-micro** — Debian + QEMU TCG; see the detailed recipe in `AGENTS.md`.
+- **Any always-on Linux machine** — `wrapper-lite-rootless` (user namespaces, no QEMU).
+- **Windows machine** — `tools\wrapper\wrapper-lite-qemu.exe` while that machine is running.
+- **No wrapper** — Apple metadata works; full-track downloads cannot be produced, but the same-provider iTunes preview can still be served with explicit preview labeling.
 
-### 2. Navigate to the project directory
+`APPLE_WRAPPER_URL` accepts a comma-separated list for multiple storefronts.
 
-```bash
-cd Qobuz-DL
-```
+## Local development
 
-### 3. Install Dependencies
+Requirements: Node.js LTS, npm, Python 3, and ffmpeg (or the bundled `ffmpeg-static` binary).
 
 ```bash
-npm i
-```
-
-### 4. Run the development server
-
-```bash
+npm install
 npm run dev
 ```
 
-## Docker Installation
+Production verification on Windows (including checkouts whose path contains an apostrophe — the Next.js metadata-loader issue is patched during `postinstall`):
 
-### 1. Clone the repo
-
-```bash
-git clone https://github.com/QobuzDL/Qobuz-DL.git
+```powershell
+$env:TEMP="$PWD\.tmp"; $env:TMP="$PWD\.tmp"
+npm run build
+npm run build:worker
+npx next start -p 3100
+node --env-file=.env worker.mjs
+$env:BASE="http://localhost:3100"; node tools/test-suite.mjs
 ```
 
-### 2. Navigate to the project directory
+Do not build from a `subst` drive root such as `Q:\`; Next.js can omit the stylesheet link from prerendered HTML in that layout, leaving the UI unstyled. Build from the real checkout path or a nested directory instead.
 
-```bash
-cd Qobuz-DL
-```
+The verification suite exercises metadata, downloads, ffprobe container/artwork validation, admin authentication, queue artifacts, and album ZIPs. Provider tests requiring expired or absent credentials are expected to report explicit credential/entitlement failures rather than fake success.
 
-### 3. Dockerfile build
+## Docker
 
 ```bash
 docker build -t qobuz-dl .
+docker compose up -d
 ```
 
-### 4. Docker compose
+For queue mode, fill `UPSTASH_REDIS_*` and `R2_*` in `.env`, then:
 
 ```bash
-docker-compose up -d
+docker compose --profile queue up --build
 ```
 
-### Setup .env (IMPORTANT)
+The image is based on Node 22 Alpine and provisions the pinned Python native-tool environment plus the Linux Apple downloader during build.
 
-Before you can use Qobuz-DL, you need to change the .env file in the root directory. The default configuration will NOT work. QOBUZ_APP_ID and QOBUZ_SECRET must be set to the correct values. To find these you can use [this tool](https://github.com/QobuzDL/Qobuz-AppID-Secret-Tool).
-Additionally, in order to download files longer than 30 seconds, a valid Qobuz token is needed. This can be found in the localuser.token key of localstorage on the [official Qobuz website](https://play.qobuz.com/) for any paying members.
+## Operational runbook
+
+### Job appears stuck
+
+1. Check `/api/metrics` for queue depth, inflight count, and worker heartbeat staleness.
+2. Check worker `/metrics` for `active`, `lastError`, retry and failure counters.
+3. Lease-expired jobs are automatically requeued. If no worker is heartbeating, restart the worker service.
+4. Terminal region/entitlement/preview failures are intentional and should not be retried indefinitely.
+
+### Apple downloads fail
+
+1. Check `/api/platform-health` → `apple.details` and wrapper regions.
+2. Verify `APPLE_MEDIA_USER_TOKEN` is present and not expired.
+3. Verify every comma-separated `APPLE_WRAPPER_URL` is reachable from the worker, not merely from your browser.
+4. Confirm the track exists in one of the wrapper account storefronts. Region locks are honest failures unless another Apple storefront adamId is available.
+
+### Spotify downloads fail
+
+1. Confirm the OAuth/native session exists (`SPOTIFY_SESSION_JSON` or Admin → Connect Spotify).
+2. Metadata client credentials do not authorize audio downloads.
+3. Free/non-eligible accounts can fail full native streaming; this is provider enforcement, not a pipeline fallback case.
+
+### Tidal metadata/download fails
+
+1. Public metadata should use OAuth client credentials. Configure `TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET` from your own Tidal developer app for production; the built-in compatibility client is only a fallback.
+2. Tidal user access tokens expire. Reconnect through the admin device-flow or configure a valid refresh token.
+3. Full playback remains entitlement- and region-gated even with a valid session.
+
+### Cache/artifact problems
+
+1. Check `/api/ready` — production queue mode should report `artifactStore: r2`.
+2. Check R2 credentials, bucket name, and endpoint.
+3. Cached artifact keys include provider, track/album, codec, bitrate, metadata/tagging, artwork recipe, and an opaque credential-scope hash. Artifacts produced with request-supplied user credentials are not shared with unrelated users; jobs using the deployment's shared credential pool intentionally share the pool-scoped cache.
+4. LRU eviction accounting is visible in `/api/metrics` as `trackedBytes`.
 
 ## Contributing
 
 1. Fork the repository.
-2. Create a new branch: `git checkout -b feature-name`.
-3. Make your changes.
-4. Push your branch: `git push origin feature-name`.
-5. Create a pull request.
+2. Create a branch: `git checkout -b feature-name`.
+3. Make the change and run `npx tsc --noEmit`, `npm run build`, `npm run build:worker`, and `node tools/test-suite.mjs` where credentials permit.
+4. Open a pull request.
 
 ## License
 

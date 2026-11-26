@@ -7,7 +7,6 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '
 import { Separator } from './ui/separator';
 import { cn } from '@/lib/utils';
 import { ActivityIcon, CheckCircle2Icon, KeyRoundIcon, PlusIcon, RefreshCwIcon, ShieldIcon, Trash2Icon, XCircleIcon } from 'lucide-react';
-import { Checkbox } from './ui/checkbox';
 
 type TokenRow = {
     token: string;
@@ -234,7 +233,7 @@ const AdminPanel = () => {
                         <Separator />
                         <div className='space-y-2'>
                             <p className='font-medium text-sm'>Connect a Spotify account (real audio)</p>
-                            <SpotifyConnect />
+                            <SpotifyConnect password={authed!} />
                             <p className='text-[10px] text-muted-foreground'>
                                 Generate a link → owner signs in → their browser lands on a dead 127.0.0.1 page → paste that full URL back here.
                             </p>
@@ -267,21 +266,6 @@ const AdminPanel = () => {
                             <p className='text-[10px] text-muted-foreground'>
                                 Where the wrapper-lite decryption service listens. Default is http://127.0.0.1:12340 — only set this if it runs
                                 elsewhere (e.g. a LAN box or remote host). Comma-separate multiple wrappers for multi-region accounts.
-                            </p>
-                            <label className='flex items-center gap-2 cursor-pointer pt-1'>
-                                <Checkbox
-                                    checked={stats?.settings?.appleFallback !== 'off'}
-                                    onCheckedChange={(on) =>
-                                        mutate(() =>
-                                            adminCall(authed!, 'set-setting', { key: 'appleFallback', value: on ? 'on' : 'off' })
-                                        )
-                                    }
-                                />
-                                <span className='text-xs'>Fall back to other platforms on region lock</span>
-                            </label>
-                            <p className='text-[10px] text-muted-foreground'>
-                                When an Apple track is not in the account storefront, fetch the same recording from Qobuz/Deezer/Tidal
-                                instead of failing. Off = return the region-lock error.
                             </p>
                         </div>
                     </div>
@@ -403,7 +387,7 @@ const AppleWrapperSetting = ({ current, onSave }: { current?: string | null; onS
     );
 };
 
-const SpotifyConnect = () => {
+const SpotifyConnect = ({ password }: { password: string }) => {
     const [authUrl, setAuthUrl] = useState('');
     const [redirectUrl, setRedirectUrl] = useState('');
     const [status, setStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
@@ -413,7 +397,7 @@ const SpotifyConnect = () => {
         setStatus('loading');
         setMessage('');
         try {
-            const res = await fetch('/api/spotify-auth');
+            const res = await fetch('/api/spotify-auth', { headers: { 'x-admin-password': password } });
             const json = await res.json();
             if (!json.success) throw new Error(json.error ?? 'failed');
             setAuthUrl(json.data.url);
@@ -428,7 +412,7 @@ const SpotifyConnect = () => {
         setStatus('loading');
         setMessage('');
         try {
-            const res = await fetch('/api/spotify-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: redirectUrl.trim() }) });
+            const res = await fetch('/api/spotify-auth', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-admin-password': password }, body: JSON.stringify({ url: redirectUrl.trim() }) });
             const json = await res.json();
             if (!json.success) throw new Error(json.error ?? 'exchange failed');
             setStatus('done');

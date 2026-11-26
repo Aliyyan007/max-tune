@@ -22,8 +22,12 @@ const nextConfig: NextConfig = {
                 source: '/(.*)',
                 headers: [
                     {
-                        key: 'Access-Control-Allow-Origin',
-                        value: '*'
+                        key: 'X-Content-Type-Options',
+                        value: 'nosniff'
+                    },
+                    {
+                        key: 'Referrer-Policy',
+                        value: 'no-referrer'
                     },
                     {
                         key: 'Cross-Origin-Opener-Policy',
@@ -32,6 +36,18 @@ const nextConfig: NextConfig = {
                     {
                         key: 'Cross-Origin-Embedder-Policy',
                         value: 'require-corp'
+                    },
+                    {
+                        key: 'X-Frame-Options',
+                        value: 'DENY'
+                    },
+                    {
+                        key: 'Strict-Transport-Security',
+                        value: 'max-age=31536000; includeSubDomains'
+                    },
+                    {
+                        key: 'Permissions-Policy',
+                        value: 'camera=(), microphone=(), geolocation=(), payment=()'
                     }
                 ]
             }

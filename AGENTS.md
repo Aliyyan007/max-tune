@@ -15,6 +15,33 @@ Qobuz-DL frontend extended to six music platforms behind one adapter layer:
   `lib/server-download.ts` resolves provider audio, decrypts (Deezer blowfish,
   Amazon Widevine), tags via `ffmpeg-static` and streams. Progress/cancel via
   `GET|POST /api/job-status`. No client ffmpeg.wasm.
+- **Download pipeline architecture** (post-refactor): one resolver
+  (`produceTrackStream`) per source — downloads are STRICTLY single-platform:
+  no cross-platform audio substitution. Region locks, entitlement walls and
+  preview-only tiers return honest errors (user picks another platform
+  deliberately; metadata/search fallback still lives in the adapters). Output:
+  `A` passthrough (no work), `B` streaming FLAC/MP3 retaggers
+  (`lib/media-taggers.ts` — exact Content-Length, zero ffmpeg), `D` staged-file
+  (one ffmpeg pass to a temp dir → `Content-Length` + `Range` resume via a
+  10-min `stagedRegistry`; streamable inputs feed ffmpeg's stdin live — no
+  drain-then-encode serial pass). Streaming A/B outputs are tee'd to disk so
+  EVERY path supports Range-resume. Resolver claims are never trusted — the
+  real container is sniffed from magic bytes (`sniffExt`) before the output
+  ext is chosen. Plain-URL sources are wrapped in `resilientStream`
+  (Range-reconnect on CDN drops + 60s idle watchdog; the reconnect path is
+  serialized and dedups a full-replay response). Deezer's CDN CL can
+  over-promise ~4B (`tailPad`) and `Blowfish.PADDING.NULL` strips trailing
+  zeros per block — decoded blocks must be re-padded to 2048. All stream
+  chains use `stream.pipeline` — bare `.pipe()` was the crash-on-error and
+  leaked-socket bug. Preview detection: resolver flags + qobuz returned
+  `duration` + a ~64kbps×duration size floor. Hidden/truncated previews still
+  fail; when full native access is unavailable, Tidal/Spotify/Apple may fall
+  back only to the SAME provider's authorized preview asset and the artifact
+  is visibly marked `(Preview)` with preview metadata.
+- **Spotify** downloads go through a persistent librespot daemon
+  (`tools/spotify-native.py --daemon` + `SpotifyDaemon` in native-tools.ts) —
+  session stays warm; per-track cost is just the CDN fetch. Serialized by
+  design (one stream per session).
 - **Quality is always max** — internal tier `'27'`, mapped per provider
   (Spotify→lossless, Amazon→Max, Apple→alac-hi, Tidal→HI_RES_LOSSLESS…). There is
   intentionally no user-facing quality setting; users pick **platform → codec**
@@ -25,9 +52,13 @@ Qobuz-DL frontend extended to six music platforms behind one adapter layer:
 
 ## Local run quirks (Windows, apostrophe in path)
 
-- The project path contains `'` → `next build` fails in
-  `next-metadata-route-loader` (upstream bug, unfixed). Workaround used here:
-  `subst Q: "D:\Aliyyan's Projects\Multi Platform 2\Qobuz-DL-main"` and build from `Q:`.
+- The project path contains `'`. The upstream `next-metadata-route-loader`
+  apostrophe bug is patched by `tools/apply-patches.mjs` during `postinstall`;
+  build from the real checkout root. Do **not** map the checkout itself to a
+  `subst` drive root (`Q:\`) and build there: Next then emits manifest keys with
+  a doubled drive separator, omits the stylesheet link from prerendered HTML,
+  and the UI appears completely unstyled. If a subst workaround is ever needed,
+  map the parent directory and build from a nested project path instead.
 - `C:\Users\*\AppData\Local\Temp\msdtadmin` is unreadable → a glob over Temp fails
   the build. Set `$env:TEMP="$PWD\.tmp"; $env:TMP="$PWD\.tmp"` for builds.
 - If `npm install` stalls on `ffmpeg-static`'s postinstall (GitHub download),
@@ -63,9 +94,9 @@ embedded-art checks), admin auth, and the album-zip flow for every platform.
 - **Region locks:** the wrapper only decrypts what its account's storefront
   licenses (`/status` → `regions`). On a lock, `downloadAppleNative` first
   re-resolves the recording under a different per-region adamId (ISRC →
-  title+artist search in the storefront); if genuinely absent it throws
-  "region-locked" and `produceTrackBytes` falls back to qobuz → deezer → tidal
-  (ISRC/duration-matched; **~30s previews are rejected and skipped**).
+  title+artist search in the storefront — same platform, still "apple");
+  if genuinely absent it throws "region-locked" — there is no cross-platform
+  audio fallback, the error surfaces to the user.
 - amdl needs `media.get-m3u8-mode: "all"` (avoids Invalid CKC) and canonical
   `…/album/<collectionId>?i=<trackId>` URLs — bare `/song/<id>` 404s. Both are
   handled in `native-tools.ts`.
@@ -122,8 +153,11 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
   ids via `/songs/{id}` relationships (search rows carry neither). iTunes
   Search API kept as fallback. Artist images do not exist anywhere in Apple's
   APIs — honest placeholder.
-- **Tidal** — anonymous v1 token path. Genre is genuinely absent from Tidal's
-  catalog API — don't fabricate.
+- **Tidal** — public metadata uses legacy v1 catalog endpoints authenticated with
+  an OAuth client-credentials token (`TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET`, or
+  the compatibility device client when unset). User bearer sessions are still
+  required for playback. Genre is genuinely absent from Tidal's catalog API —
+  don't fabricate.
 - **Amazon** — hosted gateway (`amz.dezalty.com`) + optional session JSON.
   Track rows lack ISRC — honest gap.
 - **Downloads** — upstream byte fetches retry transient net errors
@@ -135,12 +169,16 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
 - **Spotify audio downloads** (librespot via `tools/spotify-native.py` +
   OAuth session) are independent of the metadata path — unaffected by any
   pathfinder hash rotation.
-- **Apple** without `APPLE_MEDIA_USER_TOKEN`/`APPLE_WRAPPER_URL` returns the free
-  30s iTunes preview — tagged identically, flagged as preview. With wrapper +
-  media token, amdl decrypts at the account's region; cross-region adamIds get
-  re-resolved in the serving wrapper's storefront (itunes `country=<region>`),
-  then qobuz→deezer→tidal fallback if still locked.
-- **Tidal/Amazon** free-tier tokens surface the platform's own
+- **Apple** first tries the wrapper+amdl native path when
+  `APPLE_MEDIA_USER_TOKEN`/`APPLE_WRAPPER_URL` are present. If that path is
+  unavailable or fails terminally, the same-provider iTunes preview may be
+  served as a clearly labeled degraded artifact; it is never represented as a
+  full track. With wrapper + media token on an active Apple Music subscription,
+  amdl decrypts at the account's region; cross-region adamIds get re-resolved
+  in the serving wrapper's storefront (itunes `country=<region>`) — still the
+  same platform, never another provider's audio.
+- **Tidal** may similarly serve its own anonymous/web preview when full-track
+  entitlement is absent. **Amazon** free-tier tokens surface the platform's own
   eligibility/entitlement error — honest failure, not a bug.
 
 ## Normalization pitfalls (hard-won)
@@ -157,3 +195,50 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
   or every non-Qobuz artist dialog throws into the catch toast.
 - **QEMU/wrapper must stay running** for Apple downloads — it dies with its
   parent shell; restart `tools\wrapper\wrapper-lite-qemu.exe` for daily use.
+
+## Production queue architecture (current)
+
+- Queue mode is active when `UPSTASH_REDIS_URL` + `UPSTASH_REDIS_TOKEN` are set.
+  Job state lives in Redis hashes `job:<id>`; queue lists contain only ids.
+  Claims, cancellation, delayed retry, heartbeats, and stale recovery are Lua
+  scripts in `lib/queue.ts` — do not replace them with non-atomic RPOP/ZADD
+  sequences.
+- Workers use file-backed production (`stageToFile`) and streamed R2 uploads
+  (`cachePutFile`). Do not reintroduce `produceTrackBytes`/`tagAndEncode` in
+  worker hot paths; those buffer whole tracks and tagged outputs in memory.
+- Album ZIPs are queue jobs too (`kind=zip`) and are written by
+  `lib/album-zip-produce.ts` as valid store-only ZIPs on disk. Python
+  `zipfile.testzip()` validation passed locally; keep CRC/central-directory
+  validation before publishing.
+- R2 cache keys are output recipes (`cacheKeyFor`/`zipCacheKeyFor`), not just
+  provider+id+codec. Tagging, artwork, bitrate, and metadata choices are part
+  of the identity. Raw credentials must never appear in keys; request-supplied
+  audio credentials contribute only an opaque credential-scope hash so one
+  user's entitled artifact cannot become another user's cache hit. Pool/env
+  credential jobs intentionally share the pool-scoped cache.
+- Queue-mode GET endpoints are intentionally non-blocking. Clients poll
+  `/api/job-status` and only call GET after `stage=done`; the GET redirects to
+  a freshly presigned artifact URL. Long-polling the web service defeats the
+  split. Browser clients use navigation for queue artifacts because cross-origin
+  R2 redirects are not fetchable without bucket CORS; do not regress this into
+  a `fetch()`-only path.
+- The legacy `/api/stream-audio` route performs provider work in the web process
+  and is disabled in production unless `ENABLE_LEGACY_STREAM_AUDIO=1`. Keep new
+  download work in queue workers.
+- Request-supplied Apple wrapper URLs are ignored in production unless
+  `ALLOW_USER_APPLE_WRAPPER=1`; arbitrary wrapper endpoints are a blind-SSRF
+  primitive. Prefer operator env/admin configuration.
+- Redis-inline results are development-only. Production workers fail if R2 is
+  absent unless `ALLOW_INLINE_RESULTS=1` is explicitly set.
+- Set `JOB_PAYLOAD_ENCRYPTION_KEY` in production. It encrypts job payloads,
+  result URLs/metadata, sensitive errors, and Redis-bridged credential pool
+  values with AES-GCM. Losing/rotating it makes existing encrypted jobs unreadable.
+- Admin has no default password. If `ADMIN_PASSWORD` is absent the admin API is
+  disabled by design. Correct passwords reset the per-IP failure limiter.
+- Worker provisioning is shared by Docker and Render: `tools/provision-worker.sh`
+  creates `.venv-worker` and downloads pinned Linux `bin/amdl`. Docker copies
+  `worker.mjs`; Render builds it with `npm run build:worker`.
+- Tidal public metadata uses OAuth client-credentials tokens; configure
+  `TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET` for production. Playback still requires
+  a user session/refresh token and remains entitlement/region gated; do not
+  fabricate metadata or substitute another provider.

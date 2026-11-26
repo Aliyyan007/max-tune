@@ -8,6 +8,7 @@ import { getServiceTokens, serviceHeaders } from './service-tokens';
 import { outputFor, SettingsProps } from './settings-provider';
 import { StatusBarProps } from '@/components/status-bar/status-bar';
 import { ToastAction } from '@/components/ui/toast';
+import { saveUrl } from './browser-save';
 
 const sourceOf = (obj: any): string => obj?.source ?? 'qobuz';
 
@@ -37,7 +38,7 @@ const STAGE_TEXT: Record<Stage, string> = {
 // Poll /api/job-status while the server produces the file so the status bar
 // tracks real stages — resolving, fetching, tagging, pushing — with byte counts.
 // Resolves true when done, false on error/cancel.
-function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateAction<StatusBarProps>>, signal: AbortSignal): Promise<boolean> {
+function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateAction<StatusBarProps>>, signal: AbortSignal): Promise<any | false> {
     return new Promise((resolve) => {
         let lastStage = '';
         const poll = async () => {
@@ -61,10 +62,10 @@ function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateActi
                     else if (p.stage === 'done') pct = 100;
                     setStatusBar((prev) => ({ ...prev, progress: Math.min(pct, 100), description: desc }));
                 }
-                if (p.stage === 'done') return resolve(true);
+                if (p.stage === 'done') return resolve(p);
                 if (p.stage === 'error') {
                     setStatusBar((prev) => ({ ...prev, description: p.error ?? 'Download failed' }));
-                    return resolve(false);
+                    return resolve(p);
                 }
             } catch {}
             setTimeout(poll, 350);
@@ -75,27 +76,38 @@ function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateActi
 
 // For non-qobuz platforms the album object bundled with a search result is sparse —
 // fetch the full album so tags (genre/label/upc/date) are complete.
-async function enrichAlbum(result: QobuzTrack, country: string | undefined, signal?: AbortSignal) {
+// Memoized per album id — N tracks from one album used to fire N sequential calls
+// before each job was even created.
+const albumEnrichP = new Map<string, Promise<void>>();
+async function enrichAlbum(result: QobuzTrack, country: string | undefined, _signal?: AbortSignal) {
     const album = result.album;
     if (!album || album.full || sourceOf(result) === 'qobuz' || !album.id) return;
-    try {
-        const res = await axios.get('/api/get-album', {
-            params: { album_id: album.id, source: sourceOf(result) },
-            headers: { 'Token-Country': country, ...serviceHeaders() },
-            signal
-        });
-        if (res.data?.data) {
-            const full = res.data.data;
-            album.genre = full.genre ?? album.genre;
-            album.label = full.label ?? album.label;
-            album.upc = full.upc ?? album.upc;
-            album.release_date_original = full.release_date_original || album.release_date_original;
-            album.released_at = full.released_at || album.released_at;
-            album.artists = full.artists?.length ? full.artists : album.artists;
-            if (full.image?.large) album.image = full.image;
-            album.full = true;
-        }
-    } catch {}
+    const key = `${sourceOf(result)}:${album.id}`;
+    let p = albumEnrichP.get(key);
+    if (!p) {
+        p = (async () => {
+            try {
+                const res = await axios.get('/api/get-album', {
+                    params: { album_id: album.id, source: sourceOf(result) },
+                    headers: { 'Token-Country': country, ...serviceHeaders() }
+                });
+                const full = res.data?.data;
+                if (full) {
+                    album.genre = full.genre ?? album.genre;
+                    album.label = full.label ?? album.label;
+                    album.upc = full.upc ?? album.upc;
+                    album.release_date_original = full.release_date_original || album.release_date_original;
+                    album.released_at = full.released_at || album.released_at;
+                    album.artists = full.artists?.length ? full.artists : album.artists;
+                    if (full.image?.large) album.image = full.image;
+                    album.full = true;
+                }
+            } catch {}
+        })();
+        albumEnrichP.set(key, p);
+        if (albumEnrichP.size > 100) albumEnrichP.delete(albumEnrichP.keys().next().value!);
+    }
+    await p;
 }
 
 export const createDownloadJob = async (
@@ -165,16 +177,58 @@ export const createDownloadJob = async (
                     const job = res.data?.data?.job;
                     if (!job) throw new Error('download job not created');
                     jobId = job;
-                    // Chrome owns the transfer — the status bar mirrors server progress
-                    // (resolve → fetch → tag → push) so the wait is visible, not silent.
-                    const a = document.createElement('a');
-                    a.href = `/api/download-file?job=${job}`;
-                    a.download = formattedTitle;
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                    await watchJob(job, setStatusBar, signal);
-                    resolve();
+                    // Queue mode: wait for the worker-published artifact first —
+                    // the web GET is deliberately non-blocking and redirects to
+                    // object storage. Local mode keeps the old concurrent behavior
+                    // because the GET itself is the producer.
+                    const mode = res.data?.data?.mode;
+                    const saveProduced = async (outcome?: any) => {
+                        const result = await saveUrl(`/api/download-file?job=${job}`, formattedTitle, {
+                            signal,
+                            forceNav: mode === 'queue',
+                            onProgress: (received, total) =>
+                                setStatusBar((prev) => ({
+                                    ...prev,
+                                    description: total ? `Saving to disk — ${fmtMB(received)} of ${fmtMB(total)}` : `Saving to disk — ${fmtMB(received)}`,
+                                    progress: total ? Math.max(prev.progress ?? 0, Math.min(99, Math.round((99 * received) / total))) : prev.progress
+                                }))
+                        });
+                        if (result.method === 'aborted') {
+                            axios.post('/api/job-status', { id: job }).catch(() => {});
+                            return resolve();
+                        }
+                        if (outcome?.isPreview) {
+                            toast({
+                                title: 'Preview downloaded',
+                                description: `${source} only authorizes a ${outcome.previewDuration ? `${Math.round(outcome.previewDuration)}s ` : ''}preview for this account. The filename is marked “(Preview)”.`
+                            });
+                        }
+                        setStatusBar((prev) => ({ ...prev, progress: 100, description: 'Done — check your downloads' }));
+                        resolve();
+                    };
+                    if (mode === 'queue') {
+                        try {
+                            const outcome = await watchJob(job, setStatusBar, signal);
+                            if (signal.aborted) return resolve();
+                            if (!outcome) throw new Error('download monitoring ended before completion');
+                            if (outcome.stage === 'error') throw new Error(outcome.error ?? 'Download failed');
+                            await saveProduced(outcome);
+                        } catch (e) {
+                            axios.post('/api/job-status', { id: job }).catch(() => {});
+                            throw e;
+                        }
+                    } else {
+                        const watch = watchJob(job, setStatusBar, signal);
+                        try {
+                            await saveProduced();
+                        } catch (e) {
+                            // tell the server to stop producing, then rethrow for the toast
+                            axios.post('/api/job-status', { id: job }).catch(() => {});
+                            throw e;
+                        } finally {
+                            void watch;
+                        }
+                    }
                 } catch (e) {
                     if (e instanceof AxiosError && e.code === 'ERR_CANCELED') resolve();
                     else {
@@ -235,15 +289,46 @@ export const createDownloadJob = async (
                     const job = res.data?.data?.job;
                     if (!job) throw new Error('zip job not created');
                     jobId = job;
-                    const a = document.createElement('a');
-                    a.href = `/api/album-zip?job=${job}`;
-                    a.download = formattedZipTitle + '.zip';
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                    // mirror server progress — per-track "Track 3/12 — Name" labels
-                    await watchJob(job, setStatusBar, signal);
-                    resolve();
+                    // zips can be GBs — queue mode waits for the verified archive,
+                    // then object storage serves the bytes rather than the web dyno.
+                    const mode = res.data?.data?.mode;
+                    const saveZip = async (outcome?: any) => {
+                        const result = await saveUrl(`/api/album-zip?job=${job}`, formattedZipTitle + '.zip', { signal, navIfNoPicker: true, forceNav: mode === 'queue' });
+                        if (result.method === 'aborted') {
+                            axios.post('/api/job-status', { id: job }).catch(() => {});
+                            return resolve();
+                        }
+                        if (outcome?.containsPreviews || outcome?.previewCount) {
+                            toast({
+                                title: 'Preview tracks included',
+                                description: `${source} only authorized preview audio for ${outcome.previewCount ?? 'some'} track(s). Preview entries are marked “(Preview)” inside the archive.`
+                            });
+                        }
+                        setStatusBar((prev) => ({ ...prev, progress: 100, description: 'Done — check your downloads' }));
+                        resolve();
+                    };
+                    if (mode === 'queue') {
+                        try {
+                            const outcome = await watchJob(job, setStatusBar, signal);
+                            if (signal.aborted) return resolve();
+                            if (!outcome) throw new Error('zip monitoring ended before completion');
+                            if (outcome.stage === 'error') throw new Error(outcome.error ?? 'Zip failed');
+                            await saveZip(outcome);
+                        } catch (e) {
+                            axios.post('/api/job-status', { id: job }).catch(() => {});
+                            throw e;
+                        }
+                    } else {
+                        const watch = watchJob(job, setStatusBar, signal);
+                        try {
+                            await saveZip();
+                        } catch (e) {
+                            axios.post('/api/job-status', { id: job }).catch(() => {});
+                            throw e;
+                        } finally {
+                            void watch;
+                        }
+                    }
                 } catch (e) {
                     if (e instanceof AxiosError && e.code === 'ERR_CANCELED') resolve();
                     else {

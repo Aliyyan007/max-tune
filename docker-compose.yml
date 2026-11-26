@@ -1,7 +1,25 @@
 services:
-    qobuz-dl:
+    web:
         container_name: qobuz-dl
+        build: .
         image: qobuz-dl
+        env_file: .env
         ports:
             - 3000:3000
         restart: unless-stopped
+
+    # Optional production queue worker. Requires UPSTASH_REDIS_* and R2_* in .env.
+    # Run with: docker compose --profile queue up --build
+    worker:
+        container_name: qobuz-dl-worker
+        build: .
+        image: qobuz-dl
+        env_file: .env
+        command: node worker.mjs
+        environment:
+            PORT: 3101
+            WORKER_CAPS: generic,apple
+        ports:
+            - 3101:3101
+        restart: unless-stopped
+        profiles: [queue]

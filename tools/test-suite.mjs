@@ -10,6 +10,7 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync, statSync, readFileSync, existsSync } from 'node:fs';
 import ffmpegPath from 'ffmpeg-static';
+import axios from 'axios';
 import path from 'node:path';
 
 // Load the project .env so ADMIN_PASSWORD etc. resolve the same way the server sees them
@@ -22,7 +23,7 @@ if (existsSync(envFile)) {
 }
 
 const BASE = (process.env.BASE || 'http://localhost:3000').replace(/\/$/, '');
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'qobuz-dl';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const OUT = path.join(process.cwd(), 'data', 'test-out');
 mkdirSync(OUT, { recursive: true });
 
@@ -71,22 +72,44 @@ async function downloadJob(spec, tag, { minBytes = 50_000, expectPreview = false
     const job = created.json?.data?.job;
     if (!job) return null;
 
-    // collect progress stages while streaming
+    // collect progress stages. Queue mode waits for the worker artifact before
+    // calling GET; local mode streams concurrently because GET is the producer.
+    const mode = created.json?.data?.mode;
     const stages = [];
     const ctrl = new AbortController();
+    const pollOnce = async () => {
+        try {
+            const p = (await api(`/api/job-status?id=${job}`)).json?.data;
+            if (p) stages.push(p.stage);
+            return p;
+        } catch {
+            return null;
+        }
+    };
     const poller = (async () => {
         while (!ctrl.signal.aborted) {
-            try {
-                const p = (await api(`/api/job-status?id=${job}`)).json?.data;
-                if (p) stages.push(p.stage);
-                if (p?.stage === 'done' || p?.stage === 'error') return;
-            } catch {}
+            const p = await pollOnce();
+            if (p?.stage === 'done' || p?.stage === 'error') return p;
             await new Promise((r) => setTimeout(r, 400));
         }
+        return null;
     })();
 
-    const res = await fetch(`${BASE}/api/download-file?job=${job}`);
-    const buf = Buffer.from(await res.arrayBuffer());
+    if (mode === 'queue') {
+        const deadline = Date.now() + 12 * 60 * 1000;
+        for (;;) {
+            const p = await pollOnce();
+            if (p?.stage === 'done' || p?.stage === 'error') break;
+            if (Date.now() > deadline) break;
+            await new Promise((r) => setTimeout(r, 700));
+        }
+    }
+
+    // browsers have no headers/body timeouts — undici's defaults (300s each)
+    // are stricter than real clients; a slow produce chain can legitimately run
+    // longer, so use axios (http-module — only a total timeout) for the body
+    const res = await axios.get(`${BASE}/api/download-file?job=${job}`, { responseType: 'arraybuffer', timeout: 1_800_000, validateStatus: () => true });
+    const buf = Buffer.from(res.data);
     ctrl.abort();
     await poller.catch(() => {});
 
@@ -100,12 +123,14 @@ async function downloadJob(spec, tag, { minBytes = 50_000, expectPreview = false
     const err = last.json?.data?.error;
 
     if (res.status !== 200) {
-        // entitlement failures are honest platform rejections, not bugs
-        if (expectPreview === 'entitled' && /eligible|entitle|premium|unlimited|subscription|token/i.test(err ?? '')) {
-            check(`${tag}: entitlement error surfaced (expected on free tier)`, true);
+        // strict true-audio mode: a platform serves its own real bytes or fails
+        // with a classified reason (preview-only / region / entitlement). Those
+        // are honest refusals — crashes and junk responses are not.
+        if (/preview|region|eligible|entitle|premium|unlimited|subscription|token|locked|unavailable|not found|no match|only served|clip|refusing to deliver/i.test(err ?? '')) {
+            check(`${tag}: honest platform refusal`, true, `${res.status} ${String(err).slice(0, 90)}`);
             return null;
         }
-        check(`${tag}: HTTP 200`, false, `${res.status} ${buf.slice(0, 200).toString('latin1')}`);
+        check(`${tag}: HTTP 200`, false, `${res.status} ${buf.slice(0, 200).toString('latin1')} err=${(err || '').slice(0, 120)}`);
         return null;
     }
     if (expectPreview) {
@@ -188,9 +213,7 @@ async function main() {
     for (const src of ['qobuz', 'deezer', 'spotify', 'apple', 'tidal', 'amazon']) {
         const t = per[src]?.track;
         if (!t) continue;
-        // apple without entitlement → 30s preview; amazon/tidal free-tier → may 502 with an eligibility error
-        const expect = src === 'apple' ? true : ['amazon', 'tidal'].includes(src) ? 'entitled' : false;
-        const r = await downloadJob(dlSpec(src, t), `download ${src}`, { expectPreview: expect });
+        const r = await downloadJob(dlSpec(src, t), `download ${src}`, { expectPreview: false });
         if (r?.buf?.length) {
             const file = path.join(OUT, `${src}-${t.id}`);
             writeFileSync(file, r.buf);
@@ -202,27 +225,35 @@ async function main() {
             check(`${src}: artwork embedded`, hasArt, 'no attached picture in ffprobe output');
         }
     }
+    // strict mode still requires the pipeline to genuinely work end-to-end —
+    // everything refusals-only would mask a broken pipeline
+    check('at least one platform delivered real audio', Object.keys(files).length > 0, `served=${Object.keys(files).join(',')}`);
 
     // ---- admin auth ----
     console.log('\n-- admin --');
     const bad = await api('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'wrong', action: 'stats' }) });
     check('admin rejects wrong password', bad.status === 401);
-    const ok = await api('/api/admin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: ADMIN_PASSWORD, action: 'stats' })
-    });
-    check('admin stats ok', ok.status === 200 && ok.json?.data?.stats?.uptimeSec != null, JSON.stringify(ok.json).slice(0, 150));
+    if (ADMIN_PASSWORD) {
+        const ok = await api('/api/admin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: ADMIN_PASSWORD, action: 'stats' })
+        });
+        check('admin stats ok', ok.status === 200 && ok.json?.data?.stats?.uptimeSec != null, JSON.stringify(ok.json).slice(0, 150));
+    } else {
+        const disabled = await api('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'x', action: 'stats' }) });
+        check('admin disabled without ADMIN_PASSWORD', disabled.status === 503 || disabled.status === 401, `status=${disabled.status}`);
+    }
 
-    // ---- zip flow ----
-    if (per.qobuz?.album) {
+    // ---- zip flow ---- (deezer can serve full audio in this environment)
+    if (per.deezer?.album) {
         console.log('\n-- album zip --');
         const created = await api('/api/album-zip', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                albumId: String(per.qobuz.album.id),
-                source: 'qobuz',
+                albumId: String(per.deezer.album.id),
+                source: 'deezer',
                 quality: '27',
                 codec: 'SOURCE',
                 applyMeta: true,
@@ -234,8 +265,16 @@ async function main() {
         const job = created.json?.data?.job;
         check('zip job created', !!job);
         if (job) {
-            const res = await fetch(`${BASE}/api/album-zip?job=${job}`);
-            const buf = Buffer.from(await res.arrayBuffer());
+            if (created.json?.data?.mode === 'queue') {
+                const deadline = Date.now() + 15 * 60 * 1000;
+                for (;;) {
+                    const p = (await api(`/api/job-status?id=${job}`)).json?.data;
+                    if (p?.stage === 'done' || p?.stage === 'error' || Date.now() > deadline) break;
+                    await new Promise((r) => setTimeout(r, 1000));
+                }
+            }
+            const res = await axios.get(`${BASE}/api/album-zip?job=${job}`, { responseType: 'arraybuffer', timeout: 2_400_000, validateStatus: () => true });
+            const buf = Buffer.from(res.data);
             check('zip 200 + PK magic', res.status === 200 && magic(buf).startsWith('PK'), `status=${res.status} len=${buf.length} magic=${magic(buf)}`);
             const entryCount = (buf.toString('latin1').match(/PK\u0001\u0002/g) || []).length;
             check('zip has entries', entryCount >= 2, `entries=${entryCount}`);

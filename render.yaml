@@ -33,7 +33,15 @@ envVarGroups:
         sync: false
       - key: QOBUZ_APP_ID
         sync: false
-      - key: QOBUZ_APP_SECRET
+      - key: QOBUZ_SECRET
+        sync: false
+      - key: QOBUZ_AUTH_TOKENS
+        sync: false
+      - key: APPLE_WRAPPER_URL
+        sync: false
+      - key: JOB_PAYLOAD_ENCRYPTION_KEY
+        sync: false
+      - key: METRICS_TOKEN
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
@@ -45,13 +53,11 @@ services:
     plan: free
     buildCommand: npm ci && npm run build
     startCommand: npx next start -p $PORT
-    healthCheckPath: /
+    healthCheckPath: /api/health
     envVars:
       - fromGroup: maxtune-shared
       - key: NODE_VERSION
         value: "22"
-      - key: APPLE_WRAPPER_URL
-        value: http://136.111.58.129:12340
 
   # free plan forbids background_worker — it runs as a web service that binds
   # $PORT with a health endpoint (also a pinger target for cold-start keep-alive)
@@ -61,12 +67,16 @@ services:
     plan: free
     buildCommand: npm ci && npm run build:worker && bash tools/provision-worker.sh
     startCommand: node worker.mjs
-    healthCheckPath: /
+    healthCheckPath: /ready
     envVars:
       - fromGroup: maxtune-shared
       - key: NODE_VERSION
         value: "22"
       - key: WORKER_CAPS
         value: generic,apple
-      - key: APPLE_WRAPPER_URL
-        value: http://136.111.58.129:12340
+      - key: WORKER_CONCURRENCY
+        value: "1"
+      - key: JOB_MAX_ATTEMPTS
+        value: "3"
+      - key: NATIVE_PYTHON
+        value: .venv-worker/bin/python

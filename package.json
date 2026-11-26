@@ -6,7 +6,7 @@
         "dev": "next dev",
         "build": "next build",
         "start": "next start",
-        "lint": "next lint",
+        "lint": "eslint .",
         "build:worker": "esbuild worker/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=worker.mjs --external:ffmpeg-static --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
         "worker": "node --env-file=.env worker.mjs",
         "postinstall": "node tools/apply-patches.mjs"

@@ -1,9 +1,9 @@
 ﻿import axios from 'axios';
-import { pickToken } from '@/lib/token-pool';
+import { pickToken, admin } from '@/lib/token-pool';
 import fs from 'fs';
 import path from 'path';
 import { SocksProxyAgent } from 'socks-proxy-agent';
-import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toEpochSeconds, toDateString } from './normalize';
+import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, mapLimit, proxiedImg, toEpochSeconds, toDateString } from './normalize';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, RequestContext } from './types';
 import type { FetchedQobuzAlbum, QobuzTrack } from '@/lib/qobuz-dl';
 
@@ -49,12 +49,17 @@ let refreshing: Promise<string | null> | null = null;
 
 function storeToken(token: string) {
     process.env.AMAZON_MUSIC_TOKEN = token;
+    // The credential pool is mirrored to Redis, unlike process.env/.env which
+    // are local to whichever web/worker process happened to refresh first.
+    try {
+        admin.add('amazon', token, 'auto-refresh');
+    } catch {}
     try {
         const envPath = path.join(process.cwd(), '.env');
         let c = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : '';
         if (/^AMAZON_MUSIC_TOKEN=/m.test(c)) c = c.replace(/^AMAZON_MUSIC_TOKEN=.*/m, `AMAZON_MUSIC_TOKEN=${token}`);
         else c = c.trimEnd() + `\nAMAZON_MUSIC_TOKEN=${token}\n`;
-        fs.writeFileSync(envPath, c);
+        fs.writeFileSync(envPath, c, { mode: 0o600 });
     } catch {}
 }
 
@@ -107,7 +112,7 @@ async function ensureSessionExport(token: string) {
         const data = res.data;
         if (data?.website_cookies || data?.refresh_token) {
             fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true });
-            fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
+            fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
             // durable copy — Render's disk is ephemeral and the worker is a
             // separate process; without this a redeploy loses the session
             import('../queue').then((q) => q.kvSet('session:amazon', JSON.stringify(data))).catch(() => {});
@@ -247,19 +252,6 @@ function normAmazonArtist(a: any) {
 }
 
 // Bounded parallelism for per-item detail fetches.
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-    const out: R[] = new Array(items.length);
-    let i = 0;
-    await Promise.all(
-        Array.from({ length: Math.min(limit, items.length) }, async () => {
-            while (i < items.length) {
-                const idx = i++;
-                out[idx] = await fn(items[idx]);
-            }
-        })
-    );
-    return out;
-}
 
 // Production scale: album details repeat across searches/artist pages — a
 // bounded TTL cache kills the redundant gateway calls (fewer requests = fewer

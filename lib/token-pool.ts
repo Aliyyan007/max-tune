@@ -39,11 +39,61 @@ function load() {
     } catch {}
 }
 
-function save() {
+// reportToken fires per provider call — under a busy album download that's a
+// full-sync JSON write per track. Debounce to one write per quiet period.
+let saveTimer: NodeJS.Timeout | null = null;
+let lastPoolMirror = 0;
+function mirrorPoolToRedis(force = false) {
+    // Token values are credentials — kvSet encrypts them when
+    // JOB_PAYLOAD_ENCRYPTION_KEY is configured. The mirror is rate-limited so
+    // per-track health accounting does not become a Redis write storm.
+    const now = Date.now();
+    if (!force && now - lastPoolMirror < 10_000) return;
+    lastPoolMirror = now;
+    import('./queue').then((q) => q.kvSet('pool:tokenPool', JSON.stringify(store.state))).catch(() => {});
+}
+
+function saveNow() {
     try {
         fs.mkdirSync(path.dirname(FILE), { recursive: true });
-        fs.writeFileSync(FILE, JSON.stringify(store.state, null, 2));
+        fs.writeFileSync(FILE, JSON.stringify(store.state, null, 2), { mode: 0o600 });
     } catch {}
+    mirrorPoolToRedis();
+}
+function save() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        saveNow();
+    }, 2000);
+    saveTimer.unref?.();
+}
+// structural mutations (admin add/remove/toggle) need durability NOW, not in 2s
+function saveImmediate() {
+    if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+    }
+    saveNow();
+    mirrorPoolToRedis(true);
+}
+
+/** Pull the shared credential pool into this process. Web/admin writes are the
+ * authoritative copy; workers refresh this periodically because their local
+ * filesystem is private and ephemeral. */
+export async function hydrateTokenPoolFromRedis(): Promise<boolean> {
+    try {
+        const { kvGet } = await import('./queue');
+        const raw = await kvGet('pool:tokenPool');
+        if (!raw) return false;
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            store.state = parsed;
+            store.loaded = true;
+            return true;
+        }
+    } catch {}
+    return false;
 }
 
 const mask = (t: string) => (t.length <= 10 ? '•'.repeat(t.length) : t.slice(0, 6) + '…' + t.slice(-4));
@@ -76,7 +126,7 @@ export function getSetting(key: string): string | undefined {
 }
 
 /** Keys admin is allowed to set remotely. */
-export const SETTABLE_KEYS = new Set(['appleWrapperUrl', 'appleFallback', 'tidalRefreshToken']);
+export const SETTABLE_KEYS = new Set(['appleWrapperUrl', 'tidalRefreshToken']);
 
 export function setSetting(key: string, value: string) {
     if (!SETTABLE_KEYS.has(key)) throw new Error(`unknown setting ${key}`);
@@ -86,7 +136,7 @@ export function setSetting(key: string, value: string) {
     else delete settingsStore.values[key];
     try {
         fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
-        fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settingsStore.values, null, 2));
+        fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settingsStore.values, null, 2), { mode: 0o600 });
     } catch {}
     // Durable + shared with the worker — Redis survives Render restarts and is
     // visible to both processes (their disks are ephemeral and private).
@@ -100,9 +150,37 @@ export async function getSettingShared(key: string): Promise<string | undefined>
     try {
         const { kvGet } = await import('./queue');
         const v = await kvGet(`setting:${key}`);
-        if (v) return v;
+        if (v !== null) return v;
     } catch {}
     return getSetting(key);
+}
+
+/** Pull admin-managed runtime settings into this process. Workers need the
+ * synchronous `getSetting` fast path inside native download tools, so hydration
+ * mirrors Redis values into the local in-memory/file-backed settings store. */
+export async function hydrateSettingsFromRedis(): Promise<boolean> {
+    loadSettings();
+    let changed = false;
+    try {
+        const { kvGet } = await import('./queue');
+        for (const key of SETTABLE_KEYS) {
+            const v = await kvGet(`setting:${key}`);
+            if (v !== null && settingsStore.values[key] !== v) {
+                if (v) settingsStore.values[key] = v;
+                else delete settingsStore.values[key];
+                changed = true;
+            }
+        }
+        if (changed) {
+            try {
+                fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
+                fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settingsStore.values, null, 2), { mode: 0o600 });
+            } catch {}
+        }
+        return changed;
+    } catch {
+        return false;
+    }
 }
 
 /** Round-robin pick of a healthy (non-disabled) token for a platform. */
@@ -157,9 +235,7 @@ export const admin = {
             jobs,
             poolStats,
             settings: {
-                appleWrapperUrl: getSetting('appleWrapperUrl') ?? null,
-                // 'off' disables the cross-platform fallback; unset = on
-                appleFallback: getSetting('appleFallback') === 'off' ? 'off' : 'on'
+                appleWrapperUrl: getSetting('appleWrapperUrl') ?? null
             }
         };
     },
@@ -186,7 +262,7 @@ export const admin = {
         store.state[platform] ??= [];
         if (store.state[platform].some((e) => e.token === token)) return { added: false, reason: 'already exists' };
         store.state[platform].push({ token, label, addedAt: Date.now(), ok: 0, fail: 0 });
-        save();
+        saveImmediate();
         return { added: true };
     },
     remove(platform: string, tokenMaskedOrFull: string) {
@@ -194,7 +270,7 @@ export const admin = {
         const list = store.state[platform] ?? [];
         const before = list.length;
         store.state[platform] = list.filter((e) => e.token !== tokenMaskedOrFull && mask(e.token) !== tokenMaskedOrFull);
-        if (store.state[platform].length !== before) save();
+        if (store.state[platform].length !== before) saveImmediate();
         return { removed: before - store.state[platform].length };
     },
     toggle(platform: string, tokenMaskedOrFull: string, disabled: boolean) {
@@ -202,7 +278,7 @@ export const admin = {
         const e = (store.state[platform] ?? []).find((x) => x.token === tokenMaskedOrFull || mask(x.token) === tokenMaskedOrFull);
         if (e) {
             e.disabled = disabled;
-            save();
+            saveImmediate();
         }
         return { found: !!e };
     },

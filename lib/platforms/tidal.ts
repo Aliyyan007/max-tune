@@ -2,7 +2,8 @@ import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { pickToken, reportToken, tokensFor, getSettingShared, admin } from '@/lib/token-pool';
-import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
+import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, mapLimit, proxiedImg, toDateString, toEpochSeconds } from './normalize';
+import { DownloadError } from './types';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, QualityId, RequestContext } from './types';
 import type { FetchedQobuzAlbum, QobuzAlbum, QobuzTrack } from '@/lib/qobuz-dl';
 
@@ -102,29 +103,16 @@ function normArtist(a: any) {
 }
 
 // Bounded parallelism for per-item detail enrichment.
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-    const out: R[] = new Array(items.length);
-    let i = 0;
-    await Promise.all(
-        Array.from({ length: Math.min(limit, items.length) }, async () => {
-            while (i < items.length) {
-                const idx = i++;
-                out[idx] = await fn(items[idx]);
-            }
-        })
-    );
-    return out;
-}
 
 // Tracks embed a light album stub — fetch the detail once per unique album and
 // patch duration/releaseDate/tracks_count/copyright/upc into every referencing
 // track so cards/dialogs render the same stats Qobuz cards do.
-async function enrichTrackAlbums(items: any[], countryCode: string, ctx: RequestContext): Promise<void> {
+async function enrichTrackAlbums(items: any[], countryCode: string): Promise<void> {
     const byAlbum = new Map<string, any>();
     for (const t of items) if (t?.album?.id && !byAlbum.has(String(t.album.id))) byAlbum.set(String(t.album.id), t.album);
     await mapLimit([...byAlbum.keys()], 4, async (id) => {
         const alb = byAlbum.get(id)!;
-        const d = await axios.get(`${BASE}/albums/${id}`, { params: { countryCode }, headers: headers(ctx), timeout: 15000 }).then((r) => r.data).catch(() => null);
+        const d = await axios.get(`${BASE}/albums/${id}`, { params: { countryCode }, headers: await catalogHeaders(), timeout: 15000 }).then((r) => r.data).catch(() => null);
         if (!d?.id) return;
         alb.duration = d.duration || alb.duration;
         alb.tracks_count = d.numberOfTracks ?? d.numTracks ?? alb.tracks_count;
@@ -152,6 +140,40 @@ const TIDAL_SESSION_FILE = path.join(process.cwd(), 'data', 'tidal-session.json'
 // device-code grant and the refresh grant must authenticate as this client.
 const TIDAL_OAUTH_CLIENT = { id: '8SEZWa4J1NVC5U5Y', secret: 'owUYDkxddz+9FpvGX24DlxECNtFEMBxipU0lBfrbq60=' };
 let tidalRefreshing: Promise<string | null> | null = null;
+
+// ---------------- official client-credentials catalog token ----------------
+// Tidal retired the anonymous web-player token path (`x-tidal-token` now gets
+// "A user is required for this endpoint"). Public catalog metadata, however,
+// is explicitly available through OAuth client-credentials tokens. Operators
+// should set TIDAL_CLIENT_ID/TIDAL_CLIENT_SECRET from their own Tidal developer
+// app; the built-in device client remains as a compatibility fallback because
+// it is already required for the device-link user-auth flow.
+let catalogTokenCache: { token: string; expiresAt: number } | null = null;
+let catalogTokenPending: Promise<string> | null = null;
+
+async function tidalCatalogToken(): Promise<string> {
+    if (catalogTokenCache && Date.now() < catalogTokenCache.expiresAt) return catalogTokenCache.token;
+    catalogTokenPending ??= (async () => {
+        const clientId = process.env.TIDAL_CLIENT_ID || TIDAL_OAUTH_CLIENT.id;
+        const clientSecret = process.env.TIDAL_CLIENT_SECRET || TIDAL_OAUTH_CLIENT.secret;
+        const res = await axios.post(
+            'https://auth.tidal.com/v1/oauth2/token',
+            new URLSearchParams({ grant_type: 'client_credentials', client_id: clientId, client_secret: clientSecret }),
+            { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 }
+        );
+        const token = res.data?.access_token;
+        if (!token) throw new Error('Tidal client-credentials token response missing access_token');
+        catalogTokenCache = { token, expiresAt: Date.now() + Math.max(60, Number(res.data?.expires_in ?? 3600) - 120) * 1000 };
+        return String(token);
+    })().finally(() => {
+        setTimeout(() => (catalogTokenPending = null), 0);
+    });
+    return catalogTokenPending;
+}
+
+async function catalogHeaders(): Promise<Record<string, string>> {
+    return { authorization: `Bearer ${await tidalCatalogToken()}`, 'User-Agent': UA };
+}
 
 // ---- device-auth connect (link.tidal.com) -------------------------------------
 // One-time pairing: we mint a userCode, the user types it at link.tidal.com while
@@ -210,7 +232,7 @@ function tidalSessionLoad(): { refresh_token?: string } | null {
 function tidalSessionStore(fields: Record<string, string>) {
     try {
         fs.mkdirSync(path.dirname(TIDAL_SESSION_FILE), { recursive: true });
-        fs.writeFileSync(TIDAL_SESSION_FILE, JSON.stringify(fields, null, 2));
+        fs.writeFileSync(TIDAL_SESSION_FILE, JSON.stringify(fields, null, 2), { mode: 0o600 });
     } catch {}
     // rotated refresh token persists in the settings store so restarts keep the session
     if (fields.refresh_token) {
@@ -265,7 +287,9 @@ export async function refreshTidalToken(): Promise<string | null> {
 }
 
 function headers(ctx: RequestContext): Record<string, string> {
-    const token = pickToken('tidal') || ctx.tokens.tidalToken || process.env.TIDAL_ACCESS_TOKEN;
+    // getTidalSession pins the candidate that actually passed /sessions; prefer
+    // it over the pool's first rotation entry, which may be the expired one.
+    const token = ctx.tokens.tidalToken || pickToken('tidal') || process.env.TIDAL_ACCESS_TOKEN;
     if (token && !badTokens.has(token)) return { authorization: `Bearer ${token}`, 'User-Agent': UA };
     return { 'x-tidal-token': ANON_CLIENT_ID, 'User-Agent': UA };
 }
@@ -332,10 +356,18 @@ export async function resolveTidalTrack(trackId: string, quality: QualityId, ctx
                 timeout: 20000
             });
             const info = res.data;
+            // asked for FULL but got a preview asset → the account/tier can't
+            // stream this — treat like failure so another platform can serve it
+            if (info.assetPresentation && info.assetPresentation !== 'FULL') {
+                throw new DownloadError('entitlement', `Tidal only offers a ${info.assetPresentation} asset for this track`);
+            }
             const raw = Buffer.from(info.manifest, 'base64').toString('utf8');
             if (info.manifestMimeType === 'application/vnd.tidal.bts') {
                 const m = JSON.parse(raw);
                 if (m.encryptionType && m.encryptionType !== 'NONE') continue;
+                if (m.restrictions?.length) {
+                    throw new DownloadError('region', `Tidal stream restricted: ${m.restrictions.map((r: any) => r.code ?? r).join(', ')}`);
+                }
                 const url = m.urls?.[0];
                 if (!url) continue;
                 // mimeType says 'audio/mp4' even when the codec is FLAC inside
@@ -352,8 +384,14 @@ export async function resolveTidalTrack(trackId: string, quality: QualityId, ctx
                 const fmt = /flac/i.test(codec) ? ('flac' as const) : ('mp4' as const);
                 return { dashManifest: raw, format: fmt, direct: false };
             }
-        } catch (e) {
+        } catch (e: any) {
             lastErr = e;
+            // 404 + subStatus 2001 = track not licensed in the account's region —
+            // no point walking the quality ladder, escalate to cross-platform
+            if (e?.response?.status === 404 && (e?.response?.data?.subStatus === 2001 || /not found|unavailable/i.test(e?.response?.data?.userMessage ?? ''))) {
+                throw new DownloadError('region', `Tidal track ${trackId} not available in this region (subStatus 2001)`);
+            }
+            if (e instanceof DownloadError) throw e;
         }
     }
     throw lastErr ?? new Error('Tidal returned no playable stream');
@@ -386,14 +424,15 @@ export const tidalAdapter: PlatformAdapter = {
         const m = query.match(/tidal\.com\/(?:browse\/)?(track|album|artist)\/(\d+)/);
         if (m) {
             try {
+                const h = await catalogHeaders();
                 if (m[1] === 'track') {
-                    const t = (await axios.get(`${BASE}/tracks/${m[2]}`, { params: { countryCode }, headers: headers(ctx), timeout: 15000 })).data;
+                    const t = (await axios.get(`${BASE}/tracks/${m[2]}`, { params: { countryCode }, headers: h, timeout: 15000 })).data;
                     results.tracks = { limit, offset: 0, total: 1, items: [normTrack(t)] };
                 } else if (m[1] === 'album') {
-                    const a = (await axios.get(`${BASE}/albums/${m[2]}`, { params: { countryCode }, headers: headers(ctx), timeout: 15000 })).data;
+                    const a = (await axios.get(`${BASE}/albums/${m[2]}`, { params: { countryCode }, headers: h, timeout: 15000 })).data;
                     results.albums = { limit, offset: 0, total: 1, items: [normAlbum(a)] };
                 } else {
-                    const a = (await axios.get(`${BASE}/artists/${m[2]}`, { params: { countryCode }, headers: headers(ctx), timeout: 15000 })).data;
+                    const a = (await axios.get(`${BASE}/artists/${m[2]}`, { params: { countryCode }, headers: h, timeout: 15000 })).data;
                     results.artists = { limit, offset: 0, total: 1, items: [normArtist(a)] };
                 }
                 (results as any).switchTo = m[1] === 'track' ? 'tracks' : m[1] === 'album' ? 'albums' : 'artists';
@@ -402,19 +441,19 @@ export const tidalAdapter: PlatformAdapter = {
         }
         const res = await axios.get(`${BASE}/search`, {
             params: { query, types: 'ARTISTS,ALBUMS,TRACKS', countryCode, limit, offset },
-            headers: headers(ctx),
+            headers: await catalogHeaders(),
             timeout: 15000
         });
         const d = res.data;
         const trackItems = (d.tracks?.items ?? []).map((t: any) => normTrack(t));
-        await enrichTrackAlbums(trackItems, countryCode, ctx);
+        await enrichTrackAlbums(trackItems, countryCode);
         results.tracks = { limit, offset, total: d.tracks?.totalNumberOfItems ?? 0, items: trackItems };
         results.albums = { limit, offset, total: d.albums?.totalNumberOfItems ?? 0, items: (d.albums?.items ?? []).map((a: any) => normAlbum(a)) };
         const artistItems = (d.artists?.items ?? []).map((a: any) => normArtist(a));
         // search artist nodes carry no release count — one light call per card
         await mapLimit(artistItems, 4, async (a: any) => {
             const r = await axios
-                .get(`${BASE}/artists/${a.id}/albums`, { params: { countryCode, limit: 1 }, headers: headers(ctx), timeout: 15000 })
+                .get(`${BASE}/artists/${a.id}/albums`, { params: { countryCode, limit: 1 }, headers: await catalogHeaders(), timeout: 15000 })
                 .catch(() => null);
             if (r?.data?.totalNumberOfItems != null) a.albums_count = r.data.totalNumberOfItems;
         });
@@ -425,9 +464,10 @@ export const tidalAdapter: PlatformAdapter = {
 
     async getAlbumInfo(albumId, ctx) {
         const session = await getTidalSession(ctx).catch(() => ({ countryCode: ctx.country ?? 'US', userId: 0 }));
+        const h = await catalogHeaders();
         const [a, t] = await Promise.all([
-            axios.get(`${BASE}/albums/${albumId}`, { params: { countryCode: session.countryCode }, headers: headers(ctx), timeout: 15000 }),
-            axios.get(`${BASE}/albums/${albumId}/tracks`, { params: { countryCode: session.countryCode, limit: 100 }, headers: headers(ctx), timeout: 15000 })
+            axios.get(`${BASE}/albums/${albumId}`, { params: { countryCode: session.countryCode }, headers: h, timeout: 15000 }),
+            axios.get(`${BASE}/albums/${albumId}/tracks`, { params: { countryCode: session.countryCode, limit: 100 }, headers: h, timeout: 15000 })
         ]);
         const album = normAlbum(a.data) as FetchedQobuzAlbum;
         album.full = true;
@@ -435,7 +475,7 @@ export const tidalAdapter: PlatformAdapter = {
         let offset = items.length;
         while (items.length < (t.data?.totalNumberOfItems ?? 0) && offset < 500) {
             const page = await axios
-                .get(`${BASE}/albums/${albumId}/tracks`, { params: { countryCode: session.countryCode, limit: 100, offset }, headers: headers(ctx), timeout: 15000 })
+                .get(`${BASE}/albums/${albumId}/tracks`, { params: { countryCode: session.countryCode, limit: 100, offset }, headers: h, timeout: 15000 })
                 .catch(() => null);
             if (!page?.data?.items?.length) break;
             items = items.concat(page.data.items);
@@ -447,15 +487,16 @@ export const tidalAdapter: PlatformAdapter = {
 
     async getArtist(artistId, ctx) {
         const session = await getTidalSession(ctx).catch(() => ({ countryCode: ctx.country ?? 'US', userId: 0 }));
-        const res = await axios.get(`${BASE}/artists/${artistId}`, { params: { countryCode: session.countryCode }, headers: headers(ctx), timeout: 15000 });
+        const h = await catalogHeaders();
+        const res = await axios.get(`${BASE}/artists/${artistId}`, { params: { countryCode: session.countryCode }, headers: h, timeout: 15000 });
         const a = res.data;
         const out = emptyArtistResults();
         out.id = a.id;
         out.name = { display: a.name };
         out.image = a.picture ? { small: tidalImg(a.picture, 320) } : null;
-        const top = await axios.get(`${BASE}/artists/${artistId}/toptracks`, { params: { countryCode: session.countryCode, limit: 50 }, headers: headers(ctx), timeout: 15000 }).catch(() => null);
+        const top = await axios.get(`${BASE}/artists/${artistId}/toptracks`, { params: { countryCode: session.countryCode, limit: 50 }, headers: h, timeout: 15000 }).catch(() => null);
         out.top_tracks = (top?.data?.items ?? []).map((t: any) => normTrack(t));
-        const rel = await axios.get(`${BASE}/artists/${artistId}/albums`, { params: { countryCode: session.countryCode, limit: 100 }, headers: headers(ctx), timeout: 15000 }).catch(() => null);
+        const rel = await axios.get(`${BASE}/artists/${artistId}/albums`, { params: { countryCode: session.countryCode, limit: 100 }, headers: h, timeout: 15000 }).catch(() => null);
         out.releases.album = { has_more: (rel?.data?.totalNumberOfItems ?? 0) > (rel?.data?.items?.length ?? 0), items: (rel?.data?.items ?? []).map((x: any) => normAlbum(x)) };
         out.albums_count = rel?.data?.totalNumberOfItems ?? 0;
         return { artist: out };
@@ -466,7 +507,7 @@ export const tidalAdapter: PlatformAdapter = {
         const filter = releaseType === 'epSingle' ? 'EPSANDSINGLES' : releaseType === 'compilation' ? 'COMPILATIONS' : 'ALBUMS';
         const res = await axios.get(`${BASE}/artists/${artistId}/albums`, {
             params: { countryCode: session.countryCode, limit, offset, filter },
-            headers: headers(ctx),
+            headers: await catalogHeaders(),
             timeout: 15000
         });
         return { items: (res.data?.items ?? []).map((a: any) => normAlbum(a)), has_more: (res.data?.totalNumberOfItems ?? 0) > offset + limit };

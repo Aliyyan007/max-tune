@@ -2,7 +2,7 @@ import axios from 'axios';
 import fs from 'node:fs';
 import path from 'node:path';
 import { tokensFor } from '@/lib/token-pool';
-import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
+import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, mapLimit, proxiedImg, toDateString, toEpochSeconds } from './normalize';
 import { hasSpotifyNativeCreds } from './native-tools';
 import { markPfOpDead, pathfinder, PF_HASH, pfOpDead } from './spotify-partner';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, RequestContext } from './types';
@@ -64,19 +64,6 @@ async function getAppToken(ctx: RequestContext, cred: { id: string; secret: stri
     return entry.token;
 }
 
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-    const out: R[] = new Array(items.length);
-    let i = 0;
-    await Promise.all(
-        Array.from({ length: Math.min(limit, items.length) }, async () => {
-            while (i < items.length) {
-                const idx = i++;
-                out[idx] = await fn(items[idx]);
-            }
-        })
-    );
-    return out;
-}
 
 async function api(path: string, params: Record<string, any> = {}, ctx: RequestContext, maxRetries = 3): Promise<any> {
     const family = endpointFamily(path);

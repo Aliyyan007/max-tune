@@ -4,8 +4,10 @@ import fs from 'fs';
 import { apiError, getServiceTokens } from '@/lib/platforms';
 import { decryptDeezerFile, resolveDeezerTrack } from '@/lib/platforms/deezer';
 import { resolveTidalTrack } from '@/lib/platforms/tidal';
+import { dashBytes, itunesPreview } from '@/lib/server-download';
 import { downloadSpotifyNative, downloadAppleNative, downloadAmazonNative } from '@/lib/platforms/native-tools';
 import type { QualityId } from '@/lib/platforms/types';
+import { rateLimit, clientIp } from '@/lib/rate-limit';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -45,40 +47,9 @@ async function headSize(url: string, extraHeaders: Record<string, string> = {}) 
     }
 }
 
-// Assemble a fMP4 DASH stream (tidal hi-res): init segment + numbered media segments
-async function assembleDash(mpd: string): Promise<Buffer> {
-    const initMatch = mpd.match(/initialization="([^"]+)"/);
-    const mediaMatch = mpd.match(/media="([^"]+)"/);
-    if (!initMatch || !mediaMatch) throw new Error('Unparseable Tidal DASH manifest');
-    const init = initMatch[1].replace(/&amp;/g, '&');
-    const mediaTemplate = mediaMatch[1].replace(/&amp;/g, '&');
-    // collect segment urls from SegmentTimeline if present, else numbered fallback
-    const tlDur = mpd.match(/<SegmentTimeline[^>]*>([\s\S]*?)<\/SegmentTimeline>/);
-    const segUrls: string[] = [];
-    if (tlDur) {
-        // <S d=".." r=".."/> entries
-        const sEntries = [...tlDur[1].matchAll(/<S[^>]*d="(\d+)"[^>]*(?:r="(\d+)")?/g)];
-        let idx = 1;
-        for (const e of sEntries) {
-            const rep = parseInt(e[2] ?? '0') + 1;
-            for (let i = 0; i < rep; i++) segUrls.push(mediaTemplate.replace(/\$(?:Number|num)\$/g, String(idx++)));
-        }
-    } else {
-        // fallback: try numbered segments until 404 (cap 1000)
-        for (let i = 1; i <= 1000; i++) segUrls.push(mediaTemplate.replace(/\$(?:Number|num)\$/g, String(i)));
-    }
-    const parts: Buffer[] = [(await axios.get(init, { responseType: 'arraybuffer', timeout: 30000 })).data];
-    let done = false;
-    for (let i = 0; i < segUrls.length && !done; i++) {
-        try {
-            const r = await axios.get(segUrls[i], { responseType: 'arraybuffer', timeout: 30000 });
-            parts.push(Buffer.from(r.data));
-        } catch {
-            done = true; // ran past the last segment
-        }
-    }
-    return Buffer.concat(parts);
-}
+// DASH assembly moved to lib/server-download (dashBytes) — one implementation,
+// and it throws on mid-manifest segment failure instead of silently truncating.
+const assembleDash = dashBytes;
 
 // ---------------------------------------------------------------
 // Native-download cache — the HEAD size-probe used to re-run the
@@ -151,7 +122,7 @@ async function resolveAndFetch(request: NextRequest, headOnly: boolean): Promise
     if (source === 'spotify-native') {
         const id = p.get('id');
         if (!id) return new NextResponse('Missing id', { status: 400 });
-        const qMap: Record<string, 'normal' | 'high' | 'very_high' | 'lossless'> = { '27': 'lossless', '7': 'very_high', '6': 'high', '5': 'normal' };
+        const qMap: Record<string, 'normal' | 'high' | 'very_high' | 'lossless'> = { '27': 'very_high', '7': 'very_high', '6': 'high', '5': 'normal' };
         const quality = qMap[p.get('quality') ?? '7'] ?? 'very_high';
         // graceful degradation: requested → very_high → high → normal
         const ladder: ('normal' | 'high' | 'very_high' | 'lossless')[] = [quality, 'very_high', 'high', 'normal'];
@@ -174,10 +145,7 @@ async function resolveAndFetch(request: NextRequest, headOnly: boolean): Promise
         const id = p.get('id');
         if (!id) return new NextResponse('Missing id', { status: 400 });
         // iTunes lookup exposes a free 30s preview AAC for every track — no subscription needed
-        const res = await axios.get('https://itunes.apple.com/lookup', { params: { id }, timeout: 15000 });
-        const t = (res.data.results ?? []).find((r: any) => r.wrapperType === 'track');
-        const previewUrl = t?.previewUrl;
-        if (!previewUrl) throw new Error('no preview available for this track');
+        const previewUrl = await itunesPreview(id);
         if (headOnly) {
             const size = await headSize(previewUrl, { 'User-Agent': 'Mozilla/5.0' });
             return new NextResponse(null, { headers: baseHeaders('m4a', size) });
@@ -209,8 +177,20 @@ async function resolveAndFetch(request: NextRequest, headOnly: boolean): Promise
     return new NextResponse('Unknown source', { status: 400 });
 }
 
+function legacyEnabled() {
+    return process.env.ENABLE_LEGACY_STREAM_AUDIO === '1' || process.env.NODE_ENV !== 'production';
+}
+
+function legacyDisabled() {
+    return apiError(new Error('legacy direct streaming is disabled in production — use /api/download-file jobs'), 410);
+}
+
 export async function GET(request: NextRequest) {
     try {
+        if (!legacyEnabled()) return legacyDisabled();
+        if (!(await rateLimit(`stream:${clientIp(request.headers)}`, 30, 60))) {
+            return apiError(new Error('too many stream requests — slow down'), 429);
+        }
         return await resolveAndFetch(request, false);
     } catch (e: any) {
         return apiError(e, 502);
@@ -219,6 +199,10 @@ export async function GET(request: NextRequest) {
 
 export async function HEAD(request: NextRequest) {
     try {
+        if (!legacyEnabled()) return legacyDisabled();
+        if (!(await rateLimit(`stream:${clientIp(request.headers)}`, 30, 60))) {
+            return apiError(new Error('too many stream requests — slow down'), 429);
+        }
         return await resolveAndFetch(request, true);
     } catch (e: any) {
         return apiError(e, 502);

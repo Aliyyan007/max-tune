@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { pickToken } from '@/lib/token-pool';
-import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
+import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, mapLimit, proxiedImg, toDateString, toEpochSeconds } from './normalize';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, QualityId, RequestContext } from './types';
 import type { FetchedQobuzAlbum, QobuzAlbum, QobuzTrack } from '@/lib/qobuz-dl';
 
@@ -217,19 +217,6 @@ const amTotal = (bucket: any, items: number, offset: number, limit: number) => (
 // ---------------------------------------------------------------
 // iTunes fallback helpers (previous implementation, kept for resilience)
 // ---------------------------------------------------------------
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-    const out: R[] = new Array(items.length);
-    let i = 0;
-    await Promise.all(
-        Array.from({ length: Math.min(limit, items.length) }, async () => {
-            while (i < items.length) {
-                const idx = i++;
-                out[idx] = await fn(items[idx]);
-            }
-        })
-    );
-    return out;
-}
 const isExplicit = (v: any) => String(v ?? '').toLowerCase() === 'explicit';
 function art(url: string | undefined, size: number): string {
     if (!url) return '';

@@ -2,19 +2,39 @@ import { NextRequest, NextResponse } from 'next/server';
 import { admin } from '@/lib/token-pool';
 import { jobStats } from '@/lib/server-download';
 import { apiError } from '@/lib/platforms';
+import { clientIp, rateLimit, rateLimitReset } from '@/lib/rate-limit';
+import crypto from 'crypto';
 
 export const runtime = 'nodejs';
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'qobuz-dl';
+// Production hardening: there is intentionally no implicit admin password. A
+// deployment without ADMIN_PASSWORD has the panel disabled rather than being
+// one default credential away from credential-pool compromise.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? '';
+
+function passwordEquals(a: string, b: string): boolean {
+    const ha = crypto.createHash('sha256').update(a).digest();
+    const hb = crypto.createHash('sha256').update(b).digest();
+    return crypto.timingSafeEqual(ha, hb);
+}
 
 // POST {password, action, ...payload}
 // actions: stats | list | add | remove | toggle
 export async function POST(request: NextRequest) {
     try {
+        if (!ADMIN_PASSWORD) {
+            return NextResponse.json({ success: false, error: 'admin panel disabled — configure ADMIN_PASSWORD' }, { status: 503 });
+        }
+        const ip = clientIp(request.headers);
+        const rlKey = `admin:${ip}`;
+        if (!(await rateLimit(rlKey, 8, 600))) {
+            return NextResponse.json({ success: false, error: 'too many admin attempts' }, { status: 429 });
+        }
         const body = await request.json();
-        if (body?.password !== ADMIN_PASSWORD) {
+        if (!passwordEquals(String(body?.password ?? ''), ADMIN_PASSWORD)) {
             return NextResponse.json({ success: false, error: 'invalid password' }, { status: 401 });
         }
+        await rateLimitReset(rlKey);
         const { action, platform, token, label, disabled, key, value } = body ?? {};
         let data: any;
         switch (action) {

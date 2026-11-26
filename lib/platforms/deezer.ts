@@ -2,7 +2,8 @@ import axios from 'axios';
 import { pickToken, reportToken } from '@/lib/token-pool';
 import crypto from 'node:crypto';
 import { Blowfish } from 'egoroof-blowfish';
-import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, proxiedImg, toDateString, toEpochSeconds } from './normalize';
+import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, mapLimit, proxiedImg, toDateString, toEpochSeconds } from './normalize';
+import { DownloadError } from './types';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, QualityId, RequestContext } from './types';
 import type { FetchedQobuzAlbum, QobuzAlbum, QobuzTrack } from '@/lib/qobuz-dl';
 
@@ -31,20 +32,6 @@ function coverUrl(md5: string | undefined, size: string): string {
 
 // Bounded parallelism for per-item detail fetches (search payloads are light —
 // release_date/duration/genre live on the album detail object).
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-    const out: R[] = new Array(items.length);
-    let i = 0;
-    await Promise.all(
-        Array.from({ length: Math.min(limit, items.length) }, async () => {
-            while (i < items.length) {
-                const idx = i++;
-                out[idx] = await fn(items[idx]);
-            }
-        })
-    );
-    return out;
-}
-
 // Search album nodes lack release_date/duration/genre — one detail call per
 // card, bounded, so the UI shows the same stats Qobuz cards do.
 const albumDetail = async (id: string) =>
@@ -441,12 +428,20 @@ export async function resolveDeezerTrack(sngId: string, quality: QualityId, ctx:
         )
     );
     const media = res.data?.data?.[0];
-    const url = media?.media?.[0]?.sources?.map((s: any) => s.url).find(Boolean);
-    if (!url) {
-        const err = media?.errors?.[0];
-        throw new Error(`Deezer get_url failed${err ? `: ${JSON.stringify(err)}` : ' — format likely above account tier'}`);
+    // get_url error 2002 = geo-lock for the ARL's license_country — classified so
+    // the download pipeline falls through to another platform instead of dying.
+    const err0 = media?.errors?.[0];
+    if (err0?.code === 2002) {
+        throw new DownloadError('region', `Deezer track ${data.SNG_ID ?? sngId} is region-locked for this account (${session.country || 'unknown country'})`);
     }
-    return { url, format: format === 'FLAC' ? ('flac' as const) : ('mp3' as const), sngId: data.SNG_ID ?? sngId, fileSize: parseInt(data[`FILESIZE_${format}`] ?? '0') || 0 };
+    const mediaEntry = media?.media?.[0];
+    // sources[] may hold several CDN providers — keep them all as fallbacks
+    const urls: string[] = (mediaEntry?.sources ?? []).map((s: any) => s.url).filter(Boolean);
+    if (!urls.length) {
+        if (err0) throw new Error(`Deezer get_url failed: ${JSON.stringify(err0)}`);
+        throw new Error('Deezer get_url returned no sources — format likely above account tier');
+    }
+    return { urls, url: urls[0], format: format === 'FLAC' ? ('flac' as const) : ('mp3' as const), sngId: data.SNG_ID ?? sngId, fileSize: parseInt(data[`FILESIZE_${format}`] ?? '0') || 0 };
 }
 
 // ---------- blowfish decryption ----------

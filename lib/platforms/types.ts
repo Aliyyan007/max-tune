@@ -25,6 +25,21 @@ export interface DownloadInfo {
     format?: AudioFormat;
 }
 
+// ---------------- error taxonomy ----------------
+// kind classifies honest platform failures for retries, metrics, and user
+// messaging. Lives here (not server-download) so adapters can throw it without
+// a circular import.
+export type DownloadErrorKind = 'region' | 'entitlement' | 'auth' | 'unavailable' | 'network' | 'tool';
+
+export class DownloadError extends Error {
+    kind: DownloadErrorKind;
+    constructor(kind: DownloadErrorKind, msg: string) {
+        super(msg);
+        this.kind = kind;
+        this.name = 'DownloadError';
+    }
+}
+
 export interface PlatformAdapter {
     source: PlatformSource;
     search(query: string, limit: number, offset: number, ctx: RequestContext): Promise<QobuzSearchResults>;

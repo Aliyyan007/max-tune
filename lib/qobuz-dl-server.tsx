@@ -184,6 +184,7 @@ export async function getDownloadInfo(trackID: number, quality: string, options?
         },
         httpAgent: proxyAgent,
         httpsAgent: proxyAgent,
+        timeout: 30_000,
         ...requestOptions
     });
     const d = response.data;

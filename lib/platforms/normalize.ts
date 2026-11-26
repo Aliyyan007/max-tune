@@ -8,6 +8,32 @@ export function proxiedImg(url: string | null | undefined): string {
     return `/api/image-proxy?url=${encodeURIComponent(url)}`;
 }
 
+// Provider artwork CDN suffixes. Shared by the image proxy and the download
+// pipeline's direct artwork fetch — accepting arbitrary user-supplied URLs here
+// would turn the server into an authenticated internal-network fetcher (SSRF).
+export const ARTWORK_HOST_SUFFIXES = [
+    'dzcdn.net',
+    'scdn.co',
+    'spotifycdn.com',
+    'mzstatic.com',
+    'tidal.com',
+    'qobuz.com',
+    'media-amazon.com',
+    'ssl-images-amazon.com',
+    'images-amazon.com'
+];
+
+export function isAllowedArtworkUrl(url: string): boolean {
+    try {
+        const u = new URL(url);
+        if (u.protocol !== 'https:' || u.username || u.password) return false;
+        const host = u.hostname.toLowerCase();
+        return ARTWORK_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith('.' + suffix));
+    } catch {
+        return false;
+    }
+}
+
 export function emptyResults(query: string): QobuzSearchResults {
     return {
         query,
@@ -93,6 +119,21 @@ export function baseArtist(partial: Partial<QobuzArtist> & { source?: PlatformSo
         albums_count: undefined,
         ...partial
     } as QobuzArtist;
+}
+
+// Bounded parallelism — identical copies used to live in every adapter.
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+    const out: R[] = new Array(items.length);
+    let i = 0;
+    await Promise.all(
+        Array.from({ length: Math.min(limit, items.length) }, async () => {
+            while (i < items.length) {
+                const idx = i++;
+                out[idx] = await fn(items[idx]);
+            }
+        })
+    );
+    return out;
 }
 
 // Date helpers — platforms return ISO strings or year-only values

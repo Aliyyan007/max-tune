@@ -10,6 +10,13 @@ import { PY_BIN, PY_ENV } from '@/lib/platforms/native-tools';
 //   POST -> { url, ok, user } paste the dead 127.0.0.1 redirect URL they land on; exchanges the code and stores session creds
 
 const loginScript = path.join(process.cwd(), 'tools', 'spotify-login.py');
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'qobuz-dl';
+
+// Both endpoints write/read account-session material — gate behind the admin
+// password like /api/admin (was previously fully open).
+function authed(request: NextRequest): boolean {
+    return request.headers.get('x-admin-password') === ADMIN_PASSWORD;
+}
 
 function run(args: string[]): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -24,7 +31,8 @@ function run(args: string[]): Promise<any> {
     });
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+    if (!authed(request)) return Response.json({ success: false, error: 'unauthorized' }, { status: 401 });
     try {
         const data = await run(['--start']);
         if (!data?.url) return Response.json({ success: false, error: data?.error ?? 'no url' }, { status: 500 });
@@ -37,6 +45,7 @@ export async function GET() {
 const bodySchema = z.object({ url: z.string().min(10) });
 
 export async function POST(request: NextRequest) {
+    if (!authed(request)) return Response.json({ success: false, error: 'unauthorized' }, { status: 401 });
     try {
         const { url } = bodySchema.parse(await request.json());
         const data = await run(['--finish', url]);
