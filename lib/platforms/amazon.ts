@@ -73,6 +73,25 @@ export async function amazonToken(ctx?: RequestContext): Promise<string> {
 const SESSION_FILE = path.join(process.cwd(), 'data', 'amazon-session.json');
 let refreshing: Promise<string | null> | null = null;
 
+function amazonCookieObject(input: any): Record<string, string> | null {
+    if (Array.isArray(input)) {
+        const out: Record<string, string> = {};
+        for (const cookie of input) {
+            if (cookie?.name) out[String(cookie.name)] = String(cookie.value ?? '');
+        }
+        return Object.keys(out).length ? out : null;
+    }
+    if (input && typeof input === 'object' && Object.keys(input).length) return input;
+    return null;
+}
+
+function normalizedAmazonSession(payload: any): any | null {
+    if (!payload || typeof payload !== 'object') return null;
+    const websiteCookies = amazonCookieObject(payload.website_cookies) ?? amazonCookieObject(payload.cookies);
+    if (!websiteCookies) return null;
+    return { ...payload, website_cookies: websiteCookies };
+}
+
 function storeToken(token: string, staleToken?: string) {
     process.env.AMAZON_MUSIC_TOKEN = token;
     // The credential pool is mirrored to Redis, unlike process.env/.env which
@@ -98,18 +117,28 @@ export async function refreshAmazonToken(staleToken?: string): Promise<string | 
         try {
             // env first (hosted deploys ship the session as AMAZON_SESSION_JSON), then
             // the file, then the shared Redis copy written by whichever process last
-            // exported it.
-            let raw = process.env.AMAZON_SESSION_JSON || (fs.existsSync(SESSION_FILE) ? fs.readFileSync(SESSION_FILE, 'utf-8') : null);
+            // exported it. A malformed or partial earlier source must not shadow a
+            // valid later one — Render env values are easy to truncate or stale-copy.
+            const usable = (candidate: string | null | undefined) => {
+                if (!candidate) return null;
+                try {
+                    const parsed = JSON.parse(candidate);
+                    return (amazonCookieObject(parsed.website_cookies) ?? amazonCookieObject(parsed.cookies)) ? candidate : null;
+                } catch {
+                    return null;
+                }
+            };
+            let raw = usable(process.env.AMAZON_SESSION_JSON) ?? usable(fs.existsSync(SESSION_FILE) ? fs.readFileSync(SESSION_FILE, 'utf-8') : null);
             if (!raw) {
                 try {
                     const { kvGet } = await import('../queue');
-                    raw = await kvGet('session:amazon');
+                    raw = usable(await kvGet('session:amazon'));
                 } catch {}
             }
             if (!raw) return null;
             const session = JSON.parse(raw);
-            const cookies = session.website_cookies;
-            if (!cookies || typeof cookies !== 'object') return null;
+            const cookies = amazonCookieObject(session.website_cookies) ?? amazonCookieObject(session.cookies);
+            if (!cookies) return null;
             const res = await axios.post(
                 `${GATEWAY}/auth/login`,
                 { content: JSON.stringify(cookies), format: 'json', expires_in: 2592000 },
@@ -133,19 +162,38 @@ export async function refreshAmazonToken(staleToken?: string): Promise<string | 
 // are what let us re-mint JWTs long after the current one expires.
 let sessionExportedFor: string | null = null;
 async function ensureSessionExport(token: string) {
-    if (sessionExportedFor === token || fs.existsSync(SESSION_FILE)) {
-        sessionExportedFor ??= token;
-        return;
-    }
+    if (sessionExportedFor === token) return;
     try {
         const res = await axios.get(`${GATEWAY}/auth/export`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
-        const data = res.data;
-        if (data?.website_cookies || data?.refresh_token) {
+        const payload = res.data?.data ?? res.data;
+        const session = normalizedAmazonSession(payload);
+        if (session) {
+            let existingFile: any = null;
+            try {
+                existingFile = fs.existsSync(SESSION_FILE) ? JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8')) : null;
+            } catch {}
+            const fileSession = existingFile && typeof existingFile === 'object'
+                ? { ...existingFile, ...session, website_cookies: session.website_cookies }
+                : session;
+            const serialized = JSON.stringify(fileSession, null, 2);
             fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true });
-            fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
+            fs.writeFileSync(SESSION_FILE, serialized, { mode: 0o600 });
             // durable copy — Render's disk is ephemeral and the worker is a
-            // separate process; without this a redeploy loses the session
-            import('../queue').then((q) => q.kvSet('session:amazon', JSON.stringify(data))).catch(() => {});
+            // separate process; without this a redeploy loses the session. The
+            // gateway export only carries website cookies, so merge rather than
+            // overwrite a richer imported session that also has mobile license material.
+            void (async () => {
+                const q = await import('../queue');
+                let outgoing = serialized;
+                try {
+                    const existingRaw = await q.kvGet('session:amazon');
+                    const existing = existingRaw ? JSON.parse(existingRaw) : null;
+                    if (existing && typeof existing === 'object') {
+                        outgoing = JSON.stringify({ ...existing, ...session, website_cookies: session.website_cookies }, null, 2);
+                    }
+                } catch {}
+                await q.kvSet('session:amazon', outgoing);
+            })().catch(() => {});
             sessionExportedFor = token;
         }
     } catch {}

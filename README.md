@@ -45,7 +45,7 @@ Required shared infrastructure secrets:
 - `JOB_PAYLOAD_ENCRYPTION_KEY` — strong random secret
 - `ADMIN_PASSWORD` — strong unique password
 
-Provider credentials are environment-specific: `QOBUZ_APP_ID`, `QOBUZ_SECRET`, `QOBUZ_AUTH_TOKENS`, `DEEZER_ARL`, `TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET` for public Tidal metadata plus `TIDAL_ACCESS_TOKEN`/`TIDAL_REFRESH_TOKEN` for playback, `SPOTIFY_SESSION_JSON`, `APPLE_MEDIA_USER_TOKEN`, `APPLE_WRAPPER_URL`, `AMAZON_MUSIC_TOKEN`/`AMAZON_SESSION_JSON`/`AMAZON_DEVICE_WVD_B64` as applicable.
+Provider credentials are environment-specific: `QOBUZ_APP_ID`, `QOBUZ_SECRET`, `QOBUZ_AUTH_TOKENS`, `DEEZER_ARL`, `TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET` for public Tidal metadata plus `TIDAL_ACCESS_TOKEN`/`TIDAL_REFRESH_TOKEN` for playback, `SPOTIFY_SESSION_JSON`, `APPLE_MEDIA_USER_TOKEN`, `APPLE_WRAPPER_URL`, `AMAZON_MUSIC_TOKEN`/`AMAZON_SESSION_JSON`/`AMAZON_DEVICE_WVD_B64` as applicable. The admin API also accepts an authenticated `import-amazon-session` action; it stores the session in the encrypted Redis bridge so both web and worker can refresh expired gateway JWTs after ephemeral redeploys.
 
 Production queue mode requires R2. Redis-inline media results are a development fallback only (`ALLOW_INLINE_RESULTS=1`) and are deliberately disabled in production.
 

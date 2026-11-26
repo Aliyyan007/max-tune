@@ -161,7 +161,10 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
 - **Amazon** — hosted gateway (`amz.dezalty.com`) + optional mobile session JSON.
   Gateway JWT expiry is detected locally; refresh uses the exported website
   cookies, then the fresh credential is mirrored through the Redis-backed token
-  pool for web/worker sharing. Widevine licenses use the signed mobile
+  pool for web/worker sharing. The admin `import-amazon-session` action stores
+  a full session export in the encrypted Redis bridge when env provisioning is
+  impractical; malformed/partial env or file copies must not shadow that valid
+  shared copy. Widevine licenses use the signed mobile
   `getLicenseForPlaybackV2` path in `tools/amz-license.py` and are validated
   before media bytes download. `CUSTOMER_NOT_ELIGIBLE`/`REQUEST_BLOCKED` are
   honest plan or per-track availability failures, not token-refresh bugs.

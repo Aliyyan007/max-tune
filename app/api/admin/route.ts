@@ -4,6 +4,8 @@ import { jobStats } from '@/lib/server-download';
 import { apiError } from '@/lib/platforms';
 import { clientIp, rateLimit, rateLimitReset } from '@/lib/rate-limit';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 export const runtime = 'nodejs';
 
@@ -70,6 +72,27 @@ export async function POST(request: NextRequest) {
                 const { tidalDevicePoll } = await import('@/lib/platforms/tidal');
                 const r = await tidalDevicePoll(String(body.deviceCode));
                 data = { status: r.status, connected: r.status === 'done' };
+                break;
+            }
+            case 'import-amazon-session': {
+                const raw = body?.session ?? value;
+                if (!raw) throw new Error('session required');
+                const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                const cookies = parsed?.website_cookies;
+                if (!cookies || typeof cookies !== 'object' || Array.isArray(cookies) || !Object.keys(cookies).length) {
+                    throw new Error('amazon session must include website_cookies');
+                }
+                const serialized = JSON.stringify(parsed, null, 2);
+                const dir = path.join(process.cwd(), 'data');
+                fs.mkdirSync(dir, { recursive: true });
+                fs.writeFileSync(path.join(dir, 'amazon-session.json'), serialized, { mode: 0o600 });
+                const { kvSet } = await import('@/lib/queue');
+                await kvSet('session:amazon', serialized);
+                data = {
+                    imported: true,
+                    websiteCookies: true,
+                    mobileLicenseMaterial: !!(parsed.adp_token && parsed.device_private_key_pem)
+                };
                 break;
             }
             default:

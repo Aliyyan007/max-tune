@@ -318,6 +318,7 @@ async function main() {
     await hydrateTokenPoolFromRedis().catch(() => false);
     await hydrateSettingsFromRedis().catch(() => false);
     setInterval(() => {
+        hydrateSessionsFromRedis().catch(() => {});
         hydrateTokenPoolFromRedis().catch(() => false);
         hydrateSettingsFromRedis().catch(() => false);
     }, 30_000).unref();

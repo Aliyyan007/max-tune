@@ -148,18 +148,27 @@ export function materializeSessions() {
             fs.writeFileSync(path.join(dir, name), b64 ? Buffer.from(content, 'base64') : content, { mode: 0o600 });
         } catch {}
     };
+    const validJson = (content: string | undefined) => {
+        if (!content) return undefined;
+        try {
+            const parsed = JSON.parse(content);
+            return parsed && typeof parsed === 'object' ? content : undefined;
+        } catch {
+            return undefined;
+        }
+    };
     write('spotify-env-session.json', process.env.SPOTIFY_SESSION_JSON);
-    write('amazon-session.json', process.env.AMAZON_SESSION_JSON);
+    write('amazon-session.json', validJson(process.env.AMAZON_SESSION_JSON));
     write('amazon-device.wvd', process.env.AMAZON_DEVICE_WVD_B64, true);
 }
 
 // Durable session material on ephemeral hosts: the connect flows run on the web
 // process and write to its private disk — Redis is the shared store. The worker
-// hydrates at boot and lazily when a cred file is absent.
-let sessionsHydrated = false;
-export async function hydrateSessionsFromRedis(): Promise<void> {
-    if (sessionsHydrated) return;
-    sessionsHydrated = true;
+// hydrates at boot, periodically, and lazily when a cred file is absent.
+let sessionsHydratedAt = 0;
+export async function hydrateSessionsFromRedis(force = false): Promise<void> {
+    if (!force && Date.now() - sessionsHydratedAt < 30_000) return;
+    sessionsHydratedAt = Date.now();
     try {
         const { kvGet } = await import('../queue');
         const dir = path.join(process.cwd(), 'data');
@@ -172,7 +181,26 @@ export async function hydrateSessionsFromRedis(): Promise<void> {
             fs.writeFileSync(p, v, { mode: 0o600 });
         };
         await writeIfAbsent('spotify-redis.json', 'session:spotify');
-        await writeIfAbsent('amazon-session.json', 'session:amazon');
+        const amazonPath = path.join(dir, 'amazon-session.json');
+        const amazonShared = await kvGet('session:amazon');
+        if (amazonShared) {
+            const mobileMaterial = (raw: string) => {
+                try {
+                    const parsed = JSON.parse(raw);
+                    return !!(parsed?.adp_token && parsed?.device_private_key_pem);
+                } catch {
+                    return false;
+                }
+            };
+            const existing = fs.existsSync(amazonPath) ? fs.readFileSync(amazonPath, 'utf-8') : null;
+            // A website-cookie-only export can refresh gateway JWTs, but it cannot
+            // sign Widevine license requests. Prefer the shared full mobile session
+            // whenever the local file is absent or merely partial.
+            if (!existing || (!mobileMaterial(existing) && mobileMaterial(amazonShared))) {
+                fs.mkdirSync(dir, { recursive: true });
+                fs.writeFileSync(amazonPath, amazonShared, { mode: 0o600 });
+            }
+        }
     } catch {}
 }
 
@@ -1018,8 +1046,11 @@ async function fetchAmazonStream(stream: AmazonStream, dest: string): Promise<nu
 // Resolve the Widevine content key: gateway first, then local pywidevine + user .wvd
 export async function amazonWidevineKey(pssh: string, token: string, rid = '', asin = ''): Promise<string> {
     // Hosted workers receive the session export and device key as env vars; the
-    // Python license helper expects real files under data/.
+    // Python license helper expects real files under data/. Sessions can also be
+    // imported through the web admin after this worker booted, so refresh the
+    // Redis-backed copy before spending a license round-trip.
     materializeSessions();
+    await hydrateSessionsFromRedis(true).catch(() => {});
     try {
         const res = await gwFetch<{ key?: string }>('/widevine/key', token, { method: 'POST', json: { pssh } });
         if (res?.key) return res.key;
