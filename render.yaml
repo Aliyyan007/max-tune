@@ -39,8 +39,10 @@ envVarGroups:
         sync: false
       - key: APPLE_WRAPPER_URL
         sync: false
+      # Internal shared encryption secret — Render generates one random 256-bit
+      # value in the env group, so web and worker always decrypt the same jobs.
       - key: JOB_PAYLOAD_ENCRYPTION_KEY
-        sync: false
+        generateValue: true
       - key: METRICS_TOKEN
         sync: false
       - key: ADMIN_PASSWORD
