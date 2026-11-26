@@ -17,16 +17,25 @@ type TokenRow = {
     lastOkAt?: number;
     lastUsedAt?: number;
     disabled: boolean;
+    region?: string | null;
+    tier?: 'unknown' | 'free' | 'premium';
+    tierLabel?: string | null;
+    fullAudio?: 'unknown' | 'capable' | 'blocked';
+    fullAudioReason?: string | null;
+    lastFullAudioAt?: number | null;
+    lastRegionError?: string | null;
+    lastEntitlementError?: string | null;
 };
 
 const PLATFORM_LABELS: Record<string, string> = {
+    qobuz: 'Qobuz user auth token',
     deezer: 'Deezer ARL',
     tidal: 'Tidal Bearer token',
-    spotify: 'Spotify clientId:secret',
+    spotify: 'Spotify clientId:secret (metadata only)',
     apple: 'Apple media-user-token',
     amazon: 'Amazon session JWT'
 };
-const PLATFORM_ORDER = ['deezer', 'tidal', 'spotify', 'apple', 'amazon'];
+const PLATFORM_ORDER = ['qobuz', 'deezer', 'tidal', 'spotify', 'apple', 'amazon'];
 
 async function adminCall(password: string, action: string, extra: Record<string, any> = {}) {
     const res = await fetch('/api/admin', {
@@ -54,14 +63,16 @@ const AdminPanel = () => {
     const [pwError, setPwError] = useState('');
     const [authed, setAuthed] = useState<string | null>(null); // holds the password while open
     const [stats, setStats] = useState<any>(null);
+    const [platformHealth, setPlatformHealth] = useState<any>(null);
     const [tokens, setTokens] = useState<Record<string, TokenRow[]>>({});
     const [newToken, setNewToken] = useState<Record<string, string>>({});
     const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const refresh = useCallback(async (pw: string) => {
-        const data = await adminCall(pw, 'stats');
+        const [data, healthRes] = await Promise.all([adminCall(pw, 'stats'), fetch('/api/platform-health').then((r) => r.json()).catch(() => null)]);
         setStats(data.stats);
         setTokens(data.tokens ?? {});
+        setPlatformHealth(healthRes?.data?.details ?? null);
     }, []);
 
     const onDot = () => {
@@ -156,6 +167,28 @@ const AdminPanel = () => {
                         <Button variant='outline' size='sm' onClick={() => authed && refresh(authed)} className='gap-2'>
                             <RefreshCwIcon size={14} /> Refresh
                         </Button>
+                        {platformHealth && (
+                            <>
+                                <Separator />
+                                <div className='space-y-2'>
+                                    <p className='font-medium text-sm'>Platform readiness</p>
+                                    {PLATFORM_ORDER.map((plat) => {
+                                        const h = platformHealth[plat];
+                                        if (!h) return null;
+                                        return (
+                                            <div key={plat} className='rounded-md border px-2 py-1.5'>
+                                                <div className='flex items-center gap-2'>
+                                                    {h.ready ? <CheckCircle2Icon size={13} className='text-green-500' /> : <XCircleIcon size={13} className='text-destructive' />}
+                                                    <p className='text-xs font-medium capitalize'>{plat}</p>
+                                                    {Array.isArray(h.regions) && h.regions.length > 0 && <p className='text-[10px] text-muted-foreground'>regions {h.regions.join(', ')}</p>}
+                                                </div>
+                                                <p className='mt-0.5 text-[10px] text-muted-foreground'>{h.detail}</p>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </>
+                        )}
                         <Separator />
                         {/* ---- token pools ---- */}
                         {PLATFORM_ORDER.map((plat) => {
@@ -165,7 +198,9 @@ const AdminPanel = () => {
                                     <div className='flex items-center justify-between'>
                                         <p className='font-medium text-sm capitalize'>{PLATFORM_LABELS[plat] ?? plat}</p>
                                         <p className='text-xs text-muted-foreground'>
-                                            {list.filter((t) => !t.disabled).length} active / {list.length} total
+                                            {list.filter((t) => !t.disabled).length} active / {list.length} total ·{' '}
+                                            {list.filter((t) => !t.disabled && t.fullAudio === 'capable').length} full-capable ·{' '}
+                                            {list.filter((t) => !t.disabled && t.fullAudio === 'blocked').length} full-blocked
                                         </p>
                                     </div>
                                     {list.map((t, i) => (
@@ -175,10 +210,35 @@ const AdminPanel = () => {
                                             ) : (
                                                 <CheckCircle2Icon size={14} className='text-green-500 shrink-0' />
                                             )}
-                                            <div className='flex-1 min-w-0'>
-                                                <p className='text-xs font-mono truncate'>{t.token}</p>
+                                            <div className='flex-1 min-w-0 space-y-1'>
+                                                <p className='text-xs font-mono truncate'>{t.label ? `${t.label} · ` : ''}{t.token}</p>
+                                                <div className='flex flex-wrap gap-1'>
+                                                    <span className='rounded border px-1 py-0.5 text-[9px] text-muted-foreground'>region {t.region ?? 'unknown'}</span>
+                                                    <span
+                                                        className={cn(
+                                                            'rounded border px-1 py-0.5 text-[9px]',
+                                                            t.tier === 'premium' && 'border-green-600/40 text-green-600',
+                                                            t.tier === 'free' && 'border-amber-600/40 text-amber-600',
+                                                            (!t.tier || t.tier === 'unknown') && 'text-muted-foreground'
+                                                        )}
+                                                    >
+                                                        {t.tierLabel ?? `${t.tier ?? 'unknown'} tier`}
+                                                    </span>
+                                                    <span
+                                                        className={cn(
+                                                            'rounded border px-1 py-0.5 text-[9px]',
+                                                            t.fullAudio === 'capable' && 'border-green-600/40 text-green-600',
+                                                            t.fullAudio === 'blocked' && 'border-destructive/40 text-destructive',
+                                                            (!t.fullAudio || t.fullAudio === 'unknown') && 'text-muted-foreground'
+                                                        )}
+                                                    >
+                                                        full audio {t.fullAudio ?? 'unknown'}
+                                                    </span>
+                                                </div>
                                                 <p className='text-[10px] text-muted-foreground truncate'>
-                                                    {t.lastError ? <span className='text-destructive'>{t.lastError} · </span> : null}
+                                                    {t.fullAudioReason ? <span className='text-destructive'>{t.fullAudioReason} · </span> : null}
+                                                    {!t.fullAudioReason && t.lastRegionError ? <span className='text-amber-600'>{t.lastRegionError} · </span> : null}
+                                                    {!t.fullAudioReason && !t.lastRegionError && t.lastError ? <span className='text-destructive'>{t.lastError} · </span> : null}
                                                     ok {t.ok} · fail {t.fail} · used {ago(t.lastUsedAt)}
                                                 </p>
                                             </div>
@@ -228,7 +288,7 @@ const AdminPanel = () => {
                             );
                         })}
                         <p className='text-[10px] text-muted-foreground'>
-                            Tokens rotate round-robin per request and are auto-disabled on auth failure. Env-var tokens act as the fallback pool.
+                            Playback accounts rotate per download for Qobuz, Deezer, Tidal, Apple, and Amazon. Auth-dead accounts are disabled; known free-tier accounts are deprioritized, and accounts proven unable to produce full audio are used only as a last resort for the same provider&apos;s preview. Spotify clientId:secret entries are metadata credentials — Spotify full audio currently uses the single OAuth session connected below. Region and tier are learned from provider sessions and real download attempts; providers do not all expose subscription state directly.
                         </p>
                         <Separator />
                         <div className='space-y-2'>

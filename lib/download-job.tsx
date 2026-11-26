@@ -233,9 +233,10 @@ export const createDownloadJob = async (
                 } catch (e) {
                     if (e instanceof AxiosError && e.code === 'ERR_CANCELED') resolve();
                     else {
+                        const message = errDesc(e);
                         toast({
-                            title: 'Error',
-                            description: errDesc(e),
+                            title: /region limitations|region-locked|not available in this region/i.test(message) ? 'Region unavailable' : 'Error',
+                            description: message,
                             action: (
                                 <ToastAction altText='Copy Stack' onClick={() => navigator.clipboard.writeText((e as Error).stack!)}>
                                     Copy Stack
@@ -333,9 +334,10 @@ export const createDownloadJob = async (
                 } catch (e) {
                     if (e instanceof AxiosError && e.code === 'ERR_CANCELED') resolve();
                     else {
+                        const message = errDesc(e);
                         toast({
-                            title: 'Error',
-                            description: errDesc(e),
+                            title: /region limitations|region-locked|not available in this region/i.test(message) ? 'Region unavailable' : 'Error',
+                            description: message,
                             action: (
                                 <ToastAction altText='Copy Stack' onClick={() => navigator.clipboard.writeText((e as Error).stack!)}>
                                     Copy Stack

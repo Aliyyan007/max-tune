@@ -9,14 +9,18 @@ Fork of [Qobuz-DL](https://github.com/QobuzDL/Qobuz-DL) extended to six provider
 
 | Provider | Metadata | Full-audio requirement | Free/preview behavior |
 |---|---|---|---|
-| **Qobuz** | full catalog metadata | valid Qobuz account token with streaming entitlement | preview/unentitled responses fail explicitly |
-| **Deezer** | full metadata | ARL; paid accounts unlock higher formats | Deezer free accounts may serve provider-authorized 128 kbps MP3 where available |
+| **Qobuz** | full catalog metadata | valid Qobuz account token with streaming entitlement | multiple account tokens rotate per download; preview-length/unentitled responses are explicit and are never represented as full audio |
+| **Deezer** | full metadata | ARL; paid accounts unlock higher formats | Deezer free accounts may serve provider-authorized 128 kbps MP3 where available; if full audio is unavailable, Deezer's own preview may be served only as a clearly labeled preview |
 | **Spotify** | web-player/catalog metadata | connected Spotify session through the admin OAuth flow | full native audio depends on the connected account; when native access is unavailable, a provider-owned 30-second preview may be served only as a clearly labeled preview |
 | **Tidal** | public catalog metadata through OAuth client-credentials tokens (`TIDAL_CLIENT_ID`/`TIDAL_CLIENT_SECRET`, with a compatibility catalog-only fallback) | valid user session plus track entitlement/region availability | expired or missing user sessions cannot produce full audio; Tidal's own anonymous/web preview may be served as a clearly labeled preview |
 | **Amazon Music** | gateway metadata | Amazon session/token, Widevine device material, and track entitlement | expired gateway JWTs are refreshed from the stored Amazon session when possible; unentitled/free-tier tracks fail explicitly after license validation |
 | **Apple Music** | official catalog API | `wrapper-lite` plus an Apple media user token for an account with an active Apple Music subscription | if the native path is unavailable or fails terminally, the same-provider iTunes preview may be served as a clearly labeled preview; it is never represented as a full track |
 
 The downloader never substitutes audio from a different provider in strict download mode and never uses yt-dlp for platform audio.
+
+### Account-pool selection
+
+For Qobuz, Deezer, Tidal, Apple Music, and Amazon Music, playback credentials rotate per download. The resolver tries eligible accounts in priority order: user-supplied credentials, capable/unknown pool accounts, operator env credentials, then known free-tier or recently full-audio-blocked accounts as a last resort. Real provider responses update the pool: auth-dead accounts are disabled, free/limited accounts are deprioritized, region errors are remembered as diagnostics, and successful full-audio accounts are marked capable. If every candidate reports a region/availability restriction, the user receives a clear region-limitation error. If accounts are merely free-tier or unentitled, only the same provider's authorized preview may be served, visibly marked `(Preview)`. Spotify `clientId:secret` entries are metadata credentials rather than playback accounts; Spotify full audio currently uses the single OAuth session connected in the admin panel.
 
 ## Architecture
 

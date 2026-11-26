@@ -53,7 +53,7 @@ export function amazonTokenExpiring(token: string, withinMs = 5 * 60 * 1000): bo
     }
 }
 
-const candidateAmazonToken = (ctx?: RequestContext) => pickToken('amazon') || ctx?.tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN || '';
+const candidateAmazonToken = (ctx?: RequestContext) => ctx?.tokens.amazonToken || pickToken('amazon') || process.env.AMAZON_MUSIC_TOKEN || '';
 
 export async function amazonToken(ctx?: RequestContext): Promise<string> {
     const candidate = candidateAmazonToken(ctx);

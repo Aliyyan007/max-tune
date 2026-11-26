@@ -4,6 +4,7 @@ import { LucideIcon } from 'lucide-react';
 export type APIOptionProps = Partial<
     AxiosRequestConfig & {
         country: string;
+        authToken: string;
     }
 >;
 

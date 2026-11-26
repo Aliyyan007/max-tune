@@ -14,6 +14,19 @@ export interface PoolEntry {
     lastOkAt?: number;
     lastUsedAt?: number;
     disabled?: boolean;
+    // Best-effort account capabilities. `tier` describes the plan when the
+    // provider exposes or implies it; `fullAudio` is the operational decision
+    // learned from real download attempts. A free tier can still be full-audio
+    // capable on providers that legitimately serve complete low-quality tracks.
+    region?: string;
+    tier?: 'unknown' | 'free' | 'premium';
+    tierLabel?: string;
+    fullAudio?: 'unknown' | 'capable' | 'blocked';
+    fullAudioReason?: string;
+    lastFullAudioAt?: number;
+    fullAudioBlockedAt?: number;
+    lastRegionError?: string;
+    lastEntitlementError?: string;
 }
 
 type PoolState = Record<string, PoolEntry[]>;
@@ -194,6 +207,108 @@ export function pickToken(platform: string): string | undefined {
     return entry.token;
 }
 
+function envCredentialValues(envVar?: string): string[] {
+    const raw = envVar ? process.env[envVar]?.trim() : '';
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed.map((v) => String(v).trim()).filter(Boolean);
+    } catch {}
+    return raw.split(',').map((v) => v.trim()).filter(Boolean);
+}
+
+export type DownloadTokenCandidate = {
+    token: string;
+    origin: 'user' | 'pool' | 'env';
+    label?: string;
+    region?: string;
+    tier?: PoolEntry['tier'];
+    fullAudio?: PoolEntry['fullAudio'];
+};
+
+export type DownloadTokenPlan = {
+    candidates: DownloadTokenCandidate[];
+    activeAccounts: number;
+    blockedAccounts: number;
+};
+
+/** Ordered full-download account candidates. Accounts already proven unable to
+ * produce full audio are kept active for metadata/previews but skipped here;
+ * env credentials remain the operator-configured fallback. */
+export function downloadTokenPlan(platform: string, envVar: string | undefined, userToken?: string): DownloadTokenPlan {
+    load();
+    const entries = (store.state[platform] ?? []).filter((e) => !e.disabled);
+    const blocked = entries.filter((e) => e.fullAudio === 'blocked').length;
+    const rot = entries.length ? (store.counters[platform] = (store.counters[platform] ?? 0) + 1) % entries.length : 0;
+    const ordered = entries.length ? [...entries.slice(rot), ...entries.slice(0, rot)] : [];
+    const candidates: DownloadTokenCandidate[] = [];
+    const add = (token: string | undefined, origin: DownloadTokenCandidate['origin'], entry?: PoolEntry) => {
+        if (token && !candidates.some((c) => c.token === token)) {
+            candidates.push({ token, origin, label: entry?.label, region: entry?.region, tier: entry?.tier, fullAudio: entry?.fullAudio });
+        }
+    };
+    add(userToken, 'user');
+    const recentlyBlocked: PoolEntry[] = [];
+    const freeTier: PoolEntry[] = [];
+    for (const entry of ordered) {
+        // A full-audio block is operational evidence, not eternal truth: some
+        // providers report per-track ineligibility with the same code they use
+        // for plan limits. Revalidate blocked accounts after a quiet period;
+        // while another capable/unknown account exists they remain deprioritized.
+        const blockedRecently = entry.fullAudio === 'blocked' && Date.now() - (entry.fullAudioBlockedAt ?? 0) < 24 * 60 * 60 * 1000;
+        if (blockedRecently) recentlyBlocked.push(entry);
+        else if (entry.tier === 'free') freeTier.push(entry);
+        else {
+            entry.lastUsedAt = Date.now();
+            add(entry.token, 'pool', entry);
+        }
+    }
+    const envTokens = envCredentialValues(envVar);
+    for (const token of envTokens) add(token, 'env');
+    // Known free-tier accounts are a last resort while premium/unknown accounts
+    // remain. They may still serve legitimate low-quality full audio (Deezer) or
+    // the same provider's authorized preview when every capable account fails.
+    for (const entry of [...freeTier, ...recentlyBlocked]) {
+        entry.lastUsedAt = Date.now();
+        add(entry.token, 'pool', entry);
+    }
+    return { candidates, activeAccounts: entries.length + envTokens.filter((token) => !entries.some((e) => e.token === token)).length, blockedAccounts: blocked };
+}
+
+export function annotateToken(platform: string, token: string, meta: Partial<Omit<PoolEntry, 'token' | 'addedAt' | 'ok' | 'fail'>>) {
+    load();
+    const entry = (store.state[platform] ?? []).find((e) => e.token === token);
+    if (!entry) return;
+    Object.assign(entry, Object.fromEntries(Object.entries(meta).filter(([, v]) => v !== undefined)));
+    save();
+}
+
+export function reportDownloadSuccess(platform: string, token: string) {
+    annotateToken(platform, token, { fullAudio: 'capable', fullAudioReason: '', fullAudioBlockedAt: 0, lastFullAudioAt: Date.now() });
+    reportToken(platform, token, true);
+}
+
+export function reportDownloadFailure(platform: string, token: string, kind: string, error?: string) {
+    const msg = error?.slice(0, 200);
+    if (kind === 'auth') {
+        reportToken(platform, token, false, msg);
+        return;
+    }
+    if (kind === 'entitlement') {
+        annotateToken(platform, token, {
+            fullAudio: 'blocked',
+            fullAudioReason: msg,
+            fullAudioBlockedAt: Date.now(),
+            lastEntitlementError: msg,
+            tier: /free|premium|subscription|eligible|tier|plan/i.test(error ?? '') ? 'free' : undefined,
+            tierLabel: /free|premium|subscription|eligible|tier|plan/i.test(error ?? '') ? 'free/limited plan' : undefined
+        });
+    } else if (kind === 'region') {
+        annotateToken(platform, token, { lastRegionError: msg });
+    }
+    reportToken(platform, token, false, msg);
+}
+
 /** Record success/failure for a token so rotation skips dying credentials. */
 export function reportToken(platform: string, token: string, ok: boolean, error?: string) {
     load();
@@ -206,8 +321,10 @@ export function reportToken(platform: string, token: string, ok: boolean, error?
     } else {
         entry.fail++;
         entry.lastError = error?.slice(0, 200);
-        // auth failures mean the credential is dead — stop rotating into it
-        if (error && /401|403|expired|unauthor|invalid|denied|eligible/i.test(error)) entry.disabled = true;
+        // Auth failures mean the credential is dead — stop rotating into it.
+        // Entitlement denials are handled separately as full-audio blocks; they
+        // must not disable an account that is still useful for metadata/previews.
+        if (error && /401|403|expired|unauthor|invalid|BadCredentials/i.test(error)) entry.disabled = true;
     }
     save();
 }
@@ -224,9 +341,19 @@ export function tokensFor(platform: string, envVar?: string): string[] {
 export const admin = {
     stats(jobs: { active: number; total: number }) {
         load();
-        const poolStats: Record<string, { total: number; active: number; disabled: number }> = {};
+        const poolStats: Record<string, { total: number; active: number; disabled: number; fullCapable: number; fullBlocked: number; freeTier: number; premiumTier: number; unknownTier: number }> = {};
         for (const [plat, list] of Object.entries(store.state)) {
-            poolStats[plat] = { total: list.length, active: list.filter((e) => !e.disabled).length, disabled: list.filter((e) => e.disabled).length };
+            const active = list.filter((e) => !e.disabled);
+            poolStats[plat] = {
+                total: list.length,
+                active: active.length,
+                disabled: list.filter((e) => e.disabled).length,
+                fullCapable: active.filter((e) => e.fullAudio === 'capable').length,
+                fullBlocked: active.filter((e) => e.fullAudio === 'blocked').length,
+                freeTier: active.filter((e) => e.tier === 'free').length,
+                premiumTier: active.filter((e) => e.tier === 'premium').length,
+                unknownTier: active.filter((e) => !e.tier || e.tier === 'unknown').length
+            };
         }
         const mem = process.memoryUsage();
         return {
@@ -252,7 +379,16 @@ export const admin = {
                 lastError: e.lastError,
                 lastOkAt: e.lastOkAt,
                 lastUsedAt: e.lastUsedAt,
-                disabled: !!e.disabled
+                disabled: !!e.disabled,
+                region: e.region ?? null,
+                tier: e.tier ?? 'unknown',
+                tierLabel: e.tierLabel ?? null,
+                fullAudio: e.fullAudio ?? 'unknown',
+                fullAudioReason: e.fullAudioReason ?? null,
+                lastFullAudioAt: e.lastFullAudioAt ?? null,
+                fullAudioBlockedAt: e.fullAudioBlockedAt ?? null,
+                lastRegionError: e.lastRegionError ?? null,
+                lastEntitlementError: e.lastEntitlementError ?? null
             }));
         }
         return out;

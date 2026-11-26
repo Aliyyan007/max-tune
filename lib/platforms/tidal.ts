@@ -1,7 +1,7 @@
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
-import { pickToken, reportToken, tokensFor, getSettingShared, admin } from '@/lib/token-pool';
+import { annotateToken, pickToken, reportToken, tokensFor, getSettingShared, admin } from '@/lib/token-pool';
 import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, mapLimit, proxiedImg, toDateString, toEpochSeconds } from './normalize';
 import { DownloadError } from './types';
 import type { DownloadHint, DownloadInfo, PlatformAdapter, QualityId, RequestContext } from './types';
@@ -294,10 +294,26 @@ function headers(ctx: RequestContext): Record<string, string> {
     return { 'x-tidal-token': ANON_CLIENT_ID, 'User-Agent': UA };
 }
 
+async function annotateTidalAccount(token: string, countryCode: string, userId: number) {
+    const meta: Parameters<typeof annotateToken>[2] = { region: countryCode, tier: 'unknown', tierLabel: 'plan not exposed by Tidal session API' };
+    try {
+        // Legacy user subscription endpoint — not part of the playback flow, but
+        // when present it gives the operator real tier evidence instead of a guess.
+        const sub = (await axios.get(`${BASE}/users/${userId}/subscription`, { headers: { authorization: `Bearer ${token}`, 'User-Agent': UA }, timeout: 10000 })).data;
+        const quality = String(sub?.highestSoundQuality ?? sub?.soundQuality ?? sub?.type ?? '').toUpperCase();
+        if (quality) {
+            const premium = /LOSSLESS|HIFI|HI_RES|MASTER|HIGH/.test(quality);
+            meta.tier = premium ? 'premium' : 'free';
+            meta.tierLabel = `Tidal ${quality}`;
+        }
+    } catch {}
+    annotateToken('tidal', token, meta);
+}
+
 export async function getTidalSession(ctx: RequestContext): Promise<{ countryCode: string; userId: number }> {
     // Round-robin through the server pool first, then any caller-supplied/env
     // token — a stale token shouldn't mask healthy ones behind it.
-    const candidates = [pickToken('tidal'), ...tokensFor('tidal', 'TIDAL_ACCESS_TOKEN'), ctx.tokens.tidalToken].filter(
+    const candidates = (ctx.tokens.tidalToken ? [ctx.tokens.tidalToken] : [pickToken('tidal'), ...tokensFor('tidal', 'TIDAL_ACCESS_TOKEN')]).filter(
         (t, i, a): t is string => !!t && a.indexOf(t) === i
     );
     if (!candidates.length) throw new Error('Tidal requires your access token — add it in Settings → Service Tokens (or TIDAL_ACCESS_TOKEN env)');
@@ -312,6 +328,7 @@ export async function getTidalSession(ctx: RequestContext): Promise<{ countryCod
             sessionCache.set(token, session);
             ctx.tokens.tidalToken = token; // pin the working token for this request
             reportToken('tidal', token, true);
+            void annotateTidalAccount(token, session.countryCode, session.userId);
             return session;
         } catch (e: any) {
             if (e?.response?.status === 401 || /expired/i.test(e?.response?.data?.userMessage ?? '')) {
@@ -333,6 +350,7 @@ export async function getTidalSession(ctx: RequestContext): Promise<{ countryCod
             const res = await axios.get(`${BASE}/sessions`, { headers: { authorization: `Bearer ${fresh}`, 'User-Agent': UA }, timeout: 15000 });
             const session = { countryCode: res.data.countryCode ?? 'US', userId: res.data.userId, at: Date.now() };
             sessionCache.set(fresh, session);
+            void annotateTidalAccount(fresh, session.countryCode, session.userId);
             return session;
         } catch {
             // refresh produced a token the sessions endpoint rejected — fall through

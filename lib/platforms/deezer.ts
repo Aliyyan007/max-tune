@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { pickToken, reportToken } from '@/lib/token-pool';
+import { annotateToken, pickToken, reportToken } from '@/lib/token-pool';
 import crypto from 'node:crypto';
 import { Blowfish } from 'egoroof-blowfish';
 import { baseAlbum, baseArtist, baseTrack, emptyArtistResults, emptyResults, mapLimit, proxiedImg, toDateString, toEpochSeconds } from './normalize';
@@ -399,13 +399,18 @@ async function resilient<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export async function resolveDeezerTrack(sngId: string, quality: QualityId, ctx: RequestContext) {
-    const arl = pickToken('deezer') || ctx.tokens.deezerArl || process.env.DEEZER_ARL || '';
+    const arl = ctx.tokens.deezerArl || pickToken('deezer') || process.env.DEEZER_ARL || '';
     if (!arl) throw new Error('Deezer requires an ARL cookie — configure one in the admin panel (or DEEZER_ARL env)');
     const session = await resilient(() => getSession(arl)).catch((e: any) => {
         reportToken('deezer', arl, false, e?.message);
         throw e;
     });
     reportToken('deezer', arl, true);
+    annotateToken('deezer', arl, {
+        region: session.country || undefined,
+        tier: session.webLossless || session.webHq ? 'premium' : 'free',
+        tierLabel: session.webLossless ? 'Deezer Premium/HiFi (lossless)' : session.webHq ? 'Deezer Premium (HQ)' : 'Deezer Free (full MP3 128 where licensed)'
+    });
     const data = await resilient(() => getTrackData(sngId, session));
     const trackToken = data.TRACK_TOKEN;
     if (!trackToken) throw new Error('Deezer did not return a track token (track unavailable or ARL expired)');
@@ -442,6 +447,13 @@ export async function resolveDeezerTrack(sngId: string, quality: QualityId, ctx:
         throw new Error('Deezer get_url returned no sources — format likely above account tier');
     }
     return { urls, url: urls[0], format: format === 'FLAC' ? ('flac' as const) : ('mp3' as const), sngId: data.SNG_ID ?? sngId, fileSize: parseInt(data[`FILESIZE_${format}`] ?? '0') || 0 };
+}
+
+export async function resolveDeezerPreview(trackId: string): Promise<string> {
+    const res = await axios.get(`${PUBLIC_API}/track/${encodeURIComponent(trackId)}`, { timeout: 15000 });
+    const url = res.data?.preview;
+    if (!url || !/^https?:\/\//.test(url)) throw new Error('no Deezer preview available for this track');
+    return url;
 }
 
 // ---------- blowfish decryption ----------

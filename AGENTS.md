@@ -35,9 +35,10 @@ Qobuz-DL frontend extended to six music platforms behind one adapter layer:
   chains use `stream.pipeline` — bare `.pipe()` was the crash-on-error and
   leaked-socket bug. Preview detection: resolver flags + qobuz returned
   `duration` + a ~64kbps×duration size floor. Hidden/truncated previews still
-  fail; when full native access is unavailable, Tidal/Spotify/Apple may fall
-  back only to the SAME provider's authorized preview asset and the artifact
-  is visibly marked `(Preview)` with preview metadata.
+  fail; when full native access is unavailable, Tidal/Deezer/Spotify/Apple may
+  fall back only to the SAME provider's authorized preview asset and the artifact
+  is visibly marked `(Preview)` with preview metadata. Pure region exhaustion is
+  not preview-masked: it returns a clear region-limitation error.
 - **Spotify** downloads go through a persistent librespot daemon
   (`tools/spotify-native.py --daemon` + `SpotifyDaemon` in native-tools.ts) —
   session stays warm; per-track cost is just the CDN fetch. Serialized by
@@ -48,7 +49,14 @@ Qobuz-DL frontend extended to six music platforms behind one adapter layer:
   in Settings (`SOURCE` = keep the native format is the default).
 - **Admin panel** — invisible: double-click the tiny dot bottom-right →
   `ADMIN_PASSWORD`. Manages the credential pool (`lib/token-pool.ts`, persisted
-  in `data/token-pool.json`) and the Spotify OAuth connect flow.
+  in `data/token-pool.json`) and the Spotify OAuth connect flow. Pool entries
+  carry best-effort region/tier/full-audio capability metadata learned from
+  provider sessions and real download attempts. Qobuz/Deezer/Tidal/Apple/Amazon
+  playback accounts rotate per download; known free-tier accounts are
+  deprioritized and full-audio-blocked accounts are last-resort preview
+  candidates. Spotify `clientId:secret` pool entries are metadata credentials,
+  not playback accounts — Spotify full audio still uses the single connected
+  OAuth/native session.
 
 ## Local run quirks (Windows, apostrophe in path)
 

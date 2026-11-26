@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { Readable } from 'stream';
-import { getSetting, pickToken } from '@/lib/token-pool';
+import { annotateToken, getSetting, pickToken } from '@/lib/token-pool';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -593,7 +593,7 @@ export async function downloadAppleNative(
     quality: 'alac-hi' | 'alac' | 'aac',
     tokens: { appleMediaToken?: string; appleWrapper?: string; isrc?: string; title?: string; artist?: string; signal?: AbortSignal }
 ): Promise<NativeResult> {
-    const mediaToken = pickToken('apple') || tokens.appleMediaToken || process.env.APPLE_MEDIA_USER_TOKEN;
+    const mediaToken = tokens.appleMediaToken || pickToken('apple') || process.env.APPLE_MEDIA_USER_TOKEN;
     if (!mediaToken) throw new Error('Apple Music requires a media-user-token — configure one in the admin panel');
     // Windows dev uses amdl.exe; Render/Linux workers carry the ELF build as bin/amdl
     const amdl = [path.join(process.cwd(), 'bin', 'amdl.exe'), path.join(process.cwd(), 'bin', 'amdl')].find((p) => fs.existsSync(p));
@@ -767,6 +767,11 @@ export async function downloadAppleNative(
     // the serving wrapper's region drives storefront + lookup — a us-region
     // wrapper needs us-catalog URLs even when the account storefront is pk
     const useStorefront = activeWrapper.regions?.[0] || storefront;
+    annotateToken('apple', mediaToken, {
+        region: useStorefront,
+        tier: 'unknown',
+        tierLabel: 'plan not exposed by Apple media token; entitlement is learned from real downloads'
+    });
 
     // amdl 404s on bare /song/<id> URLs — resolve the canonical album-style URL
     // (…/album/<slug>/<collectionId>?i=<trackId>) via iTunes lookup in the
@@ -1077,7 +1082,7 @@ const isAmazonIneligible = (e: any) => /CUSTOMER_NOT_ELIGIBLE|REQUEST_BLOCKED|cu
 // The license must be proven here; the stream endpoint alone over-reports tiers
 // that Amazon later refuses to license.
 export async function resolveAmazonStreams(asin: string, quality: AmazonQuality, tokens: { amazonToken?: string }) {
-    let token = pickToken('amazon') || tokens.amazonToken || process.env.AMAZON_MUSIC_TOKEN;
+    let token = tokens.amazonToken || pickToken('amazon') || process.env.AMAZON_MUSIC_TOKEN;
     if (!token) throw new Error('Amazon Music needs an account token — get one at amz.dezalty.com, then paste it in Settings → Service Tokens');
     const { amazonToken } = await import('./amazon');
     token = (await amazonToken({ tokens })) || token;

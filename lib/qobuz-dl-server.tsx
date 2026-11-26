@@ -1,5 +1,6 @@
 import { getTokenForCountry, tokenCountriesMap } from '@/config/token-countries';
 import { APIOptionProps, QobuzArtist, QobuzSearchResults } from './qobuz-dl';
+import { DownloadError } from './platforms/types';
 import axios from 'axios';
 
 // Functions only to be used by servers
@@ -160,8 +161,8 @@ export async function getAlbumInfo(album_id: string, options?: APIOptionProps) {
 
 export async function getDownloadInfo(trackID: number, quality: string, options?: APIOptionProps) {
     testForRequirements();
-    const { country, ...requestOptions } = options || {};
-    const token = country ? getTokenForCountry(country) : getRandomToken();
+    const { country, authToken, ...requestOptions } = options || {};
+    const token = authToken || (country ? getTokenForCountry(country) : getRandomToken());
 
     const timestamp = Math.floor(new Date().getTime() / 1000);
     const r_sig = `trackgetFileUrlformat_id${quality}intentstreamtrack_id${trackID}${timestamp}${process.env.QOBUZ_SECRET}`;
@@ -193,7 +194,9 @@ export async function getDownloadInfo(trackID: number, quality: string, options?
         // a url — surface the entitlement reason instead of a bare "Invalid URL".
         const codes = (d?.restrictions ?? []).map((r: any) => r?.code).filter(Boolean);
         const msg = d?.status?.message ?? d?.message;
-        throw new Error(`Qobuz: no stream URL for this account${codes.length ? ` (${codes.join(', ')})` : ''}${msg ? ` — ${msg}` : ''}`);
+        const detail = `Qobuz: no stream URL for this account${codes.length ? ` (${codes.join(', ')})` : ''}${msg ? ` — ${msg}` : ''}`;
+        const regionish = /country|region|geo|territory|not available/i.test(`${codes.join(' ')} ${msg ?? ''}`);
+        throw new DownloadError(regionish ? 'region' : 'entitlement', detail);
     }
     return d;
 }

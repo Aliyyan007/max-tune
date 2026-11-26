@@ -20,11 +20,11 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import axios from 'axios';
-import { resolveDeezerTrack, blowfishKey } from './platforms/deezer';
+import { resolveDeezerTrack, resolveDeezerPreview, blowfishKey } from './platforms/deezer';
 import { resolveTidalTrack, resolveTidalPreview } from './platforms/tidal';
 import { getDownloadInfo } from './qobuz-dl-server';
 import { downloadAppleNative, resolveAmazonStreams, streamSpotifyNative, ffmpegBin } from './platforms/native-tools';
-import { pickToken } from './token-pool';
+import { downloadTokenPlan, pickToken, reportDownloadFailure, reportDownloadSuccess } from './token-pool';
 import { Blowfish } from 'egoroof-blowfish';
 import { FlacRetagger, Mp3Retagger, FormatMismatchError, buildFFMetadata, flacPictureBlockBytes, buildId3v2 } from './media-taggers';
 import { DownloadError, type DownloadErrorKind, type PlatformSource, type RequestContext } from './platforms/types';
@@ -129,6 +129,8 @@ const RE_ENTITLE = /eligible|entitle|premium.?required|subscription|tier|license
 const RE_PREVIEW = /preview|sample/i;
 
 export function classifyDlError(e: any): DownloadErrorKind {
+    if (e instanceof DownloadError) return e.kind;
+    if (['region', 'entitlement', 'auth', 'unavailable', 'network', 'tool'].includes(e?.kind)) return e.kind;
     const msg = `${e?.message ?? ''} ${e?.kind ?? ''}`;
     if (e instanceof FormatMismatchError) return 'tool';
     if (RE_PREVIEW.test(msg) && RE_REGION.test(msg)) return 'region';
@@ -585,10 +587,12 @@ export async function spotifyPreview(id: string): Promise<string> {
 }
 
 function isPreviewFallbackCause(e: any): boolean {
-    // Once the full provider-native path has failed terminally, the same
-    // provider's authorized preview is a useful degraded artifact. Cancellation
-    // is the exception: it must stop work rather than start another resolve.
-    return !/cancelled/i.test(`${e?.kind ?? ''} ${e?.message ?? ''}`);
+    // Region exhaustion is a licensing answer, not a tier downgrade: the user
+    // asked for a clear region error and no silent preview substitution in that
+    // case. Other terminal full-audio failures may still degrade to the same
+    // provider's authorized preview. Cancellation always stops work.
+    if (/cancelled/i.test(`${e?.kind ?? ''} ${e?.message ?? ''}`)) return false;
+    return classifyDlError(e) !== 'region';
 }
 
 async function previewUpstream(source: string, trackId: string, signal?: AbortSignal): Promise<Upstream | null> {
@@ -597,6 +601,9 @@ async function previewUpstream(source: string, trackId: string, signal?: AbortSi
     try {
         if (source === 'tidal') {
             url = (await resolveTidalPreview(trackId)).url;
+            format = 'mp3';
+        } else if (source === 'deezer') {
+            url = await resolveDeezerPreview(trackId);
             format = 'mp3';
         } else if (source === 'spotify' || source === 'spotify-native') {
             url = await spotifyPreview(trackId);
@@ -624,7 +631,8 @@ async function resolveQobuz(id: string, quality: string, ctx: RequestContext) {
     let lastErr: any = null;
     for (const fmt of ladder) {
         try {
-            return await getDownloadInfo(Number(id), fmt as any, ctx.country ? { country: ctx.country } : {});
+            const authToken = (ctx.tokens as any).qobuzAuthToken;
+            return await getDownloadInfo(Number(id), fmt as any, { ...(ctx.country ? { country: ctx.country } : {}), ...(authToken ? { authToken } : {}) });
         } catch (e: any) {
             lastErr = e;
             // only ladder on a tier-entitlement rejection - a '400'/signature
@@ -793,6 +801,116 @@ function looksLikePreview(up: Upstream, spec: DownloadSpec): boolean {
     return false;
 }
 
+// Credential-pool rotation is meaningful only where the credential represents
+// an actual playback account. Spotify's clientId:secret entries are metadata
+// app credentials (not librespot accounts), and Qobuz tokens are currently
+// operator env credentials rather than admin-pool playback accounts.
+const ACCOUNT_ROTATION: Record<string, { tokenField: 'deezerArl' | 'tidalToken' | 'appleMediaToken' | 'amazonToken' | 'qobuzAuthToken'; envVar?: string; label: string }> = {
+    qobuz: { tokenField: 'qobuzAuthToken', envVar: 'QOBUZ_AUTH_TOKENS', label: 'Qobuz' },
+    deezer: { tokenField: 'deezerArl', envVar: 'DEEZER_ARL', label: 'Deezer' },
+    tidal: { tokenField: 'tidalToken', envVar: 'TIDAL_ACCESS_TOKEN', label: 'Tidal' },
+    apple: { tokenField: 'appleMediaToken', envVar: 'APPLE_MEDIA_USER_TOKEN', label: 'Apple Music' },
+    'apple-native': { tokenField: 'appleMediaToken', envVar: 'APPLE_MEDIA_USER_TOKEN', label: 'Apple Music' },
+    amazon: { tokenField: 'amazonToken', envVar: 'AMAZON_MUSIC_TOKEN', label: 'Amazon Music' },
+    'amazon-native': { tokenField: 'amazonToken', envVar: 'AMAZON_MUSIC_TOKEN', label: 'Amazon Music' }
+};
+
+function exhaustionError(source: string, failures: { kind: DownloadErrorKind; message: string }[], accountsTried: number): DownloadError | null {
+    const label = ACCOUNT_ROTATION[source]?.label ?? source;
+    const regions = failures.filter((f) => f.kind === 'region').length;
+    const entitlements = failures.filter((f) => f.kind === 'entitlement').length;
+    const tried = `${accountsTried} account${accountsTried === 1 ? '' : 's'}`;
+    if (regions) {
+        const mixed = entitlements ? ` ${entitlements} other account${entitlements === 1 ? '' : 's'} also lacked full-track entitlement.` : '';
+        const regionDetail =
+            regions === accountsTried
+                ? 'every candidate reported a region or availability restriction'
+                : `${regions} of ${accountsTried} candidates reported a region or availability restriction`;
+        return new DownloadError(
+            'region',
+            `No active ${label} account in the server pool can offer this download because of region limitations. Tried ${tried}; ${regionDetail}.${mixed}`
+        );
+    }
+    if (entitlements) {
+        return new DownloadError(
+            'entitlement',
+            `All active ${label} accounts in the server pool are free-tier or not entitled to full-track audio. Tried ${tried}; using ${label}'s own clearly marked preview when available.`
+        );
+    }
+    return null;
+}
+
+/** Resolve full audio by trying every eligible playback account for the selected
+ * platform. Known full-audio-blocked/free accounts are skipped; unknown accounts
+ * are tried in rotation and real provider failures teach the pool which account
+ * is region-limited, expired, or no longer entitled. */
+async function rawProduceAccountAware(source: string, trackId: string, spec: DownloadSpec, ctx: RequestContext, signal?: AbortSignal): Promise<Upstream> {
+    const rotation = ACCOUNT_ROTATION[source];
+    if (!rotation) return rawProduce(source, trackId, spec, ctx, signal);
+
+    const userToken = spec.tokens?.[rotation.tokenField];
+    const plan = downloadTokenPlan(source === 'apple-native' ? 'apple' : source === 'amazon-native' ? 'amazon' : source, rotation.envVar, userToken);
+    if (!plan.candidates.length) {
+        if (plan.blockedAccounts) {
+            throw new DownloadError(
+                'entitlement',
+                `All active ${rotation.label} accounts in the server pool are currently marked free-tier or unable to produce full-track audio. A clearly marked ${rotation.label} preview will be used only if ${rotation.label} itself provides one.`
+            );
+        }
+        return rawProduce(source, trackId, spec, ctx, signal);
+    }
+
+    const failures: { kind: DownloadErrorKind; message: string }[] = [];
+    let lastErr: any = null;
+    let savedPreview: Upstream | null = null;
+    const discardUpstream = (upstream: Upstream) => {
+        upstream.stream?.destroy();
+        if (upstream.file) fs.unlink(upstream.file, () => {});
+        upstream.cleanup?.();
+    };
+    const poolPlatform = source === 'apple-native' ? 'apple' : source === 'amazon-native' ? 'amazon' : source;
+    for (let index = 0; index < plan.candidates.length; index++) {
+        const candidate = plan.candidates[index];
+        if (signal?.aborted) throw new Error('cancelled');
+        const pinnedTokens = { ...(spec.tokens ?? {}), [rotation.tokenField]: candidate.token } as Record<string, string>;
+        const pinnedSpec: DownloadSpec = { ...spec, tokens: pinnedTokens };
+        const pinnedCtx: RequestContext = { ...ctx, tokens: { ...(ctx.tokens as any), [rotation.tokenField]: candidate.token } };
+        try {
+            const upstream = await rawProduce(source, trackId, pinnedSpec, pinnedCtx, signal);
+            const previewOnly = !!upstream.isPreview || looksLikePreview(upstream, pinnedSpec);
+            // A preview-length response is not proof that every account is
+            // preview-only. Keep walking the pool so a premium/capable account
+            // can serve the full track; the final candidate may still return
+            // the same provider's explicitly labeled preview.
+            if (previewOnly && index < plan.candidates.length - 1) {
+                if (!savedPreview) savedPreview = upstream;
+                else discardUpstream(upstream);
+                const message = `${rotation.label} returned only a preview-length asset for this account`;
+                failures.push({ kind: 'entitlement', message });
+                if (candidate.origin === 'pool') reportDownloadFailure(poolPlatform, candidate.token, 'entitlement', message);
+                continue;
+            }
+            if (!previewOnly && candidate.origin === 'pool') reportDownloadSuccess(poolPlatform, candidate.token);
+            if (savedPreview && savedPreview !== upstream) discardUpstream(savedPreview);
+            return upstream;
+        } catch (e: any) {
+            lastErr = e;
+            const kind = classifyDlError(e);
+            const message = String(e?.message ?? 'download failed').slice(0, 240);
+            failures.push({ kind, message });
+            if (candidate.origin === 'pool') reportDownloadFailure(poolPlatform, candidate.token, kind, message);
+        }
+    }
+
+    const regionFailures = failures.some((f) => f.kind === 'region');
+    const entitlementFailures = failures.some((f) => f.kind === 'entitlement');
+    const exhausted = exhaustionError(source, failures, plan.candidates.length);
+    if (!regionFailures && entitlementFailures && savedPreview) return savedPreview;
+    if (savedPreview) discardUpstream(savedPreview);
+    if (exhausted) throw exhausted;
+    throw lastErr ?? new DownloadError('unavailable', `${rotation.label} returned no playable stream from any configured account`);
+}
+
 // Resolve audio STRICTLY from the spec's platform — downloads are never
 // silently substituted with another platform's audio. When a free/anonymous
 // tier cannot unlock the full recording, use that same provider's authorized
@@ -811,7 +929,7 @@ export async function produceTrackStream(spec: DownloadSpec, signal?: AbortSigna
     let up: Upstream;
     try {
         try {
-            up = await rawProduce(String(spec.source), String(spec.id), spec, ctx, srcSig);
+            up = await rawProduceAccountAware(String(spec.source), String(spec.id), spec, ctx, srcSig);
         } catch (e: any) {
             // The source-resolution timeout aborts srcSig. Preview fallback must
             // not inherit that aborted signal — it is a fresh degraded resolve,
