@@ -419,16 +419,25 @@ export async function resolveTidalTrack(trackId: string, quality: QualityId, ctx
 // account (the PREVIEW asset via the older v1 playbackinfo endpoint — postpaywall
 // demands auth). Used when no session token exists — honest degraded quality.
 export async function resolveTidalPreview(trackId: string): Promise<{ url: string; format: 'mp3' }> {
-    const res = await axios.get(`${BASE}/tracks/${trackId}/playbackinfo`, {
-        params: { assetpresentation: 'FULL', audioquality: 'LOW', playbackmode: 'STREAM', countryCode: 'US' },
-        headers: { 'x-tidal-token': ANON_CLIENT_ID, 'User-Agent': UA },
-        timeout: 15000
-    });
-    const info = res.data;
-    const m = JSON.parse(Buffer.from(info.manifest, 'base64').toString('utf8'));
-    const url = m.urls?.[0];
-    if (!url) throw new Error('no anonymous Tidal preview for this track');
-    return { url, format: 'mp3' };
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const res = await axios.get(`${BASE}/tracks/${trackId}/playbackinfo`, {
+                params: { assetpresentation: 'FULL', audioquality: 'LOW', playbackmode: 'STREAM', countryCode: 'US' },
+                headers: { 'x-tidal-token': ANON_CLIENT_ID, 'User-Agent': UA },
+                timeout: 30000
+            });
+            const info = res.data;
+            const m = JSON.parse(Buffer.from(info.manifest, 'base64').toString('utf8'));
+            const url = m.urls?.[0];
+            if (!url) throw new Error('no anonymous Tidal preview for this track');
+            return { url, format: 'mp3' };
+        } catch (e: any) {
+            lastErr = e;
+            if (e?.response?.status && e.response.status < 500) throw e;
+        }
+    }
+    throw lastErr ?? new Error('no anonymous Tidal preview for this track');
 }
 
 export const tidalAdapter: PlatformAdapter = {

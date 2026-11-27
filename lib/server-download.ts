@@ -333,6 +333,16 @@ async function resilientStream(
                 }
                 received += b.length;
                 if (!out.push(b)) cur!.pause();
+                // Some CDNs deliver exactly Content-Length bytes but leave the
+                // socket open instead of emitting end. Byte completeness is
+                // sufficient — don't reconnect into a certain 416 and discard a
+                // complete payload merely because EOF never arrived.
+                if (total && received >= total) {
+                    try {
+                        cur?.destroy();
+                    } catch {}
+                    finish();
+                }
             });
             cur!.on('end', () => {
                 if (ended) return;
