@@ -102,9 +102,13 @@ function decryptText(s: string): string {
     return Buffer.concat([decipher.update(Buffer.from(datab, 'base64')), decipher.final()]).toString('utf8');
 }
 
-const SENSITIVE_FIELDS = new Set(['payload', 'resultJson', 'resultUrl', 'error']);
+const SENSITIVE_FIELDS = new Set(['payload', 'resultJson', 'resultUrl']);
 function encodeField(key: string, value: any): string {
     const raw = typeof value === 'string' ? value : JSON.stringify(value);
+    // Errors are public diagnostics after credential/URL scrubbing. Keeping them
+    // unencrypted lets users see an actionable configuration error even when a
+    // deployment accidentally runs web and worker with mismatched payload keys.
+    if (key === 'error') return publicErrorMessage(raw) ?? '';
     return ENC_KEY && SENSITIVE_FIELDS.has(key) ? encryptText(raw) : raw;
 }
 function decodeField(key: string, value: string): any {
@@ -361,6 +365,12 @@ export async function dequeueJob(queues: string[], workerId: string, leaseMs = L
                 continue;
             }
             let payload = j.payload;
+            if (typeof payload === 'string' && payload.startsWith('<undecodable:')) {
+                await jobDone(id, false, {
+                    error: 'deployment configuration error: the web service and worker are using different JOB_PAYLOAD_ENCRYPTION_KEY values. Remove service-level overrides or copy the exact shared key to both services, redeploy them, and retry with a new download.'
+                }, token);
+                continue;
+            }
             if (typeof payload === 'string') {
                 try {
                     payload = JSON.parse(payload);
