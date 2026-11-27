@@ -21,6 +21,7 @@ import { stageToFile, probeFileDuration, classifyDlError, pipelineSlots, artifac
 import { produceAlbumZipFile, type AlbumZipSpec } from '../lib/album-zip-produce';
 import { hydrateSessionsFromRedis } from '../lib/platforms/native-tools';
 import { hydrateTokenPoolFromRedis, hydrateSettingsFromRedis } from '../lib/token-pool';
+import { liveDownloadsEnabled, validLiveToken } from '../lib/live-download';
 
 // NOTE: the bundle never imports lib/platforms/index (the module that sets
 // axios keep-alive) — without this every upstream call pays a fresh TCP+TLS.
@@ -86,6 +87,186 @@ function validateZipSpec(spec: any): asserts spec is AlbumZipSpec {
     if (!spec.source || !spec.albumId || !spec.zipName) throw new Error('zip payload missing source/albumId/zipName');
 }
 
+// Complete-artifact live sessions: once validation has produced a real file,
+// the browser can read that file directly while the normal R2 upload runs in
+// parallel. This preserves final-size/integrity guarantees without exposing a
+// partially produced object.
+type LiveSession = {
+    id: string;
+    file: string;
+    dir: string;
+    ext: string;
+    filename: string;
+    size: number;
+    expiresAt: number;
+    activeStreams: number;
+    uploadDone: boolean;
+    cleanupTimer?: NodeJS.Timeout;
+};
+const liveSessions = new Map<string, LiveSession>();
+const LIVE_SESSION_TTL_MS = Number(process.env.LIVE_SESSION_TTL_MS ?? 10 * 60 * 1000);
+const LIVE_IDLE_CLEANUP_MS = Number(process.env.LIVE_IDLE_CLEANUP_MS ?? 45 * 1000);
+const LIVE_MAX_STREAMS = Math.max(1, Number(process.env.LIVE_MAX_STREAMS ?? 6));
+
+function activeLiveStreams(): number {
+    let n = 0;
+    for (const session of liveSessions.values()) n += session.activeStreams;
+    return n;
+}
+
+function clearLiveTimer(session: LiveSession) {
+    if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+    session.cleanupTimer = undefined;
+}
+
+function destroyLiveSession(session: LiveSession) {
+    if (liveSessions.get(session.id) === session) liveSessions.delete(session.id);
+    clearLiveTimer(session);
+    fs.rmSync(session.dir, { recursive: true, force: true });
+}
+
+function scheduleLiveCleanup(session: LiveSession, delay = LIVE_IDLE_CLEANUP_MS) {
+    clearLiveTimer(session);
+    session.cleanupTimer = setTimeout(() => {
+        if (session.activeStreams > 0) return;
+        destroyLiveSession(session);
+    }, delay);
+    session.cleanupTimer.unref?.();
+}
+
+function registerLiveSession(args: { id: string; file: string; dir: string; ext: string; filename: string; size: number }): LiveSession {
+    const previous = liveSessions.get(args.id);
+    if (previous) destroyLiveSession(previous);
+    const session: LiveSession = {
+        ...args,
+        expiresAt: Date.now() + LIVE_SESSION_TTL_MS,
+        activeStreams: 0,
+        uploadDone: false
+    };
+    liveSessions.set(args.id, session);
+    return session;
+}
+
+function finishLiveArtifact(session: LiveSession) {
+    session.uploadDone = true;
+    if (session.activeStreams === 0) scheduleLiveCleanup(session);
+}
+
+function releaseLiveStream(session: LiveSession) {
+    session.activeStreams = Math.max(0, session.activeStreams - 1);
+    if (session.uploadDone || Date.now() >= session.expiresAt) scheduleLiveCleanup(session, 1000);
+}
+
+const LIVE_MIME: Record<string, string> = {
+    flac: 'audio/flac', mp3: 'audio/mpeg', m4a: 'audio/mp4', mp4: 'audio/mp4',
+    webm: 'audio/webm', opus: 'audio/webm', ogg: 'audio/ogg', wav: 'audio/wav'
+};
+
+function liveCorsHeaders(): Record<string, string> {
+    return {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+        'Access-Control-Allow-Headers': 'Range',
+        'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Content-Disposition',
+        'Cache-Control': 'no-store'
+    };
+}
+
+function sendLiveJson(res: http.ServerResponse, status: number, body: Record<string, any>) {
+    res.writeHead(status, { ...liveCorsHeaders(), 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+}
+
+async function handleLiveRequest(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204, liveCorsHeaders());
+        res.end();
+        return;
+    }
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        sendLiveJson(res, 405, { ok: false, error: 'method not allowed' });
+        return;
+    }
+    const id = decodeURIComponent(url.pathname.split('/')[2] ?? '');
+    if (!liveDownloadsEnabled() || !validLiveToken(id, url.searchParams.get('token') ?? '')) {
+        sendLiveJson(res, 403, { ok: false, error: 'invalid live download token' });
+        return;
+    }
+    const session = liveSessions.get(id);
+    if (!session || Date.now() >= session.expiresAt || !fs.existsSync(session.file)) {
+        const j = await jobGet(id).catch(() => null);
+        const terminal = j?.stage === 'done' || j?.stage === 'error';
+        sendLiveJson(res, terminal ? 410 : 202, {
+            ok: false,
+            error: terminal ? 'live artifact expired — use the published artifact' : 'live artifact is not ready yet'
+        });
+        return;
+    }
+
+    if (activeLiveStreams() >= LIVE_MAX_STREAMS) {
+        sendLiveJson(res, 429, { ok: false, error: 'too many live artifact streams — use the published artifact when ready' });
+        return;
+    }
+
+    const total = session.size;
+    let start = 0;
+    let end = total - 1;
+    let status = 200;
+    const range = typeof req.headers.range === 'string' ? req.headers.range : '';
+    if (range) {
+        const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+        if (!m || (!m[1] && !m[2])) {
+            res.writeHead(416, { ...liveCorsHeaders(), 'Content-Range': `bytes */${total}` });
+            res.end();
+            return;
+        }
+        if (!m[1]) {
+            const suffix = Number(m[2]);
+            start = Math.max(0, total - suffix);
+            end = total - 1;
+        } else {
+            start = Number(m[1]);
+            end = m[2] ? Math.min(Number(m[2]), total - 1) : total - 1;
+        }
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start >= total || end < start) {
+            res.writeHead(416, { ...liveCorsHeaders(), 'Content-Range': `bytes */${total}` });
+            res.end();
+            return;
+        }
+        status = 206;
+    }
+
+    const headers: Record<string, string | number> = {
+        ...liveCorsHeaders(),
+        'Content-Type': LIVE_MIME[session.ext] ?? 'application/octet-stream',
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(session.filename)}`,
+        'Content-Length': end - start + 1,
+        'Accept-Ranges': 'bytes',
+        'X-Live-Artifact': 'worker'
+    };
+    if (status === 206) headers['Content-Range'] = `bytes ${start}-${end}/${total}`;
+    if (req.method === 'HEAD') {
+        res.writeHead(status, headers);
+        res.end();
+        return;
+    }
+
+    session.activeStreams++;
+    clearLiveTimer(session);
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        releaseLiveStream(session);
+    };
+    res.on('close', release);
+    res.setTimeout(LIVE_SESSION_TTL_MS, () => res.destroy(new Error('live stream timeout')));
+    const body = fs.createReadStream(session.file, { start, end, highWaterMark: 1 << 20 });
+    body.on('error', () => res.destroy());
+    res.writeHead(status, headers);
+    body.pipe(res);
+}
+
 async function uploadArtifact(args: {
     id: string;
     file: string;
@@ -147,6 +328,7 @@ async function processTrack(id: string, spec: DownloadSpec, signal: AbortSignal)
     } finally {
         release();
     }
+    let liveSession: LiveSession | null = null;
     try {
         if (!fs.existsSync(staged.file) || fs.statSync(staged.file).size !== staged.size || staged.size <= 0) {
             throw new Error('produced track artifact failed size validation');
@@ -162,26 +344,37 @@ async function processTrack(id: string, spec: DownloadSpec, signal: AbortSignal)
         }
 
         const filename = artifactFilename(spec.filename, staged.ext, staged.isPreview);
-        return await uploadArtifact({
-            id,
-            file: staged.file,
-            ext: staged.ext,
-            filename,
-            // Preview artifacts are deliverable but deliberately non-reusable:
-            // keying them by job id prevents a free-tier artifact from becoming
-            // a stale cache hit after the account later gains entitlement.
-            cacheKey: staged.isPreview ? `${previewCacheKeyFor(spec)}/job-${id}` : cacheKeyFor(spec),
-            extra: {
-                kind: 'track',
-                source: spec.source,
-                trackId: spec.id,
-                servedBy: staged.servedBy,
-                isPreview: !!staged.isPreview,
-                previewDuration: staged.isPreview ? Math.round(gotDuration * 10) / 10 : undefined
-            }
-        });
+        if (liveDownloadsEnabled()) {
+            liveSession = registerLiveSession({ id, file: staged.file, dir: staged.dir, ext: staged.ext, filename, size: staged.size });
+            await jobSet(id, { liveReady: '1', liveExpiresAt: liveSession.expiresAt }).catch(() => {});
+        }
+        try {
+            return await uploadArtifact({
+                id,
+                file: staged.file,
+                ext: staged.ext,
+                filename,
+                // Preview artifacts are deliverable but deliberately non-reusable:
+                // keying them by job id prevents a free-tier artifact from becoming
+                // a stale cache hit after the account later gains entitlement.
+                cacheKey: staged.isPreview ? `${previewCacheKeyFor(spec)}/job-${id}` : cacheKeyFor(spec),
+                extra: {
+                    kind: 'track',
+                    source: spec.source,
+                    trackId: spec.id,
+                    servedBy: staged.servedBy,
+                    isPreview: !!staged.isPreview,
+                    previewDuration: staged.isPreview ? Math.round(gotDuration * 10) / 10 : undefined
+                }
+            });
+        } finally {
+            if (liveSession) finishLiveArtifact(liveSession);
+        }
     } finally {
-        fs.rmSync(staged.dir, { recursive: true, force: true });
+        // A registered live session owns the staged directory until the direct
+        // browser stream and/or grace period finishes. Non-live jobs keep the
+        // original immediate cleanup behavior.
+        if (!liveSession) fs.rmSync(staged.dir, { recursive: true, force: true });
     }
 }
 
@@ -286,10 +479,14 @@ const PORT = Number(process.env.PORT ?? 3101);
 const server = http.createServer(async (req, res) => {
     try {
         const url = new URL(req.url ?? '/', 'http://localhost');
+        if (url.pathname.startsWith('/live/')) {
+            await handleLiveRequest(req, res, url);
+            return;
+        }
         if (url.pathname === '/metrics') {
             const [depths, counters] = await Promise.all([queueDepths().catch(() => ({})), jobCounters().catch(() => ({}))]);
             res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-            res.end(JSON.stringify({ ok: true, worker: WORKER_ID, caps: CAPS, active, concurrency: CONCURRENCY, up: Math.floor(process.uptime()), metrics, queue: depths, counters }));
+            res.end(JSON.stringify({ ok: true, worker: WORKER_ID, caps: CAPS, active, concurrency: CONCURRENCY, live: { sessions: liveSessions.size, streams: activeLiveStreams(), maxStreams: LIVE_MAX_STREAMS }, up: Math.floor(process.uptime()), metrics, queue: depths, counters }));
             return;
         }
         if (url.pathname === '/ready') {

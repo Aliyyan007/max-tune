@@ -46,13 +46,19 @@ const STAGE_TEXT: Record<Stage, string> = {
 // Poll /api/job-status while the server produces the file so the status bar
 // tracks real stages — resolving, fetching, tagging, pushing — with byte counts.
 // Resolves true when done, false on error/cancel.
-function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateAction<StatusBarProps>>, signal: AbortSignal): Promise<any | false> {
+function watchJob(
+    jobId: string,
+    setStatusBar: React.Dispatch<React.SetStateAction<StatusBarProps>>,
+    signal: AbortSignal,
+    opts?: { onLiveReady?: () => void }
+): Promise<any | false> {
     return new Promise((resolve) => {
         let lastStage = '';
         let lastBytes = 0;
         let lastBytesAt = 0;
         let lastBytesStage = '';
         let smoothSpeed = 0;
+        let liveNotified = false;
         const startedAt = Date.now();
         const poll = async () => {
             if (signal.aborted) return resolve(false);
@@ -65,6 +71,10 @@ function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateActi
                         return;
                     }
                     return resolve(false); // aged out — Chrome already has it
+                }
+                if (!liveNotified && (p.liveReady === '1' || p.liveReady === 1 || p.liveReady === true)) {
+                    liveNotified = true;
+                    opts?.onLiveReady?.();
                 }
                 if (p.stage !== lastStage || ['downloading', 'uploading', 'sending', 'queued'].includes(p.stage)) {
                     lastStage = p.stage;
@@ -255,21 +265,7 @@ export const createDownloadJob = async (
                             ? `${formatTitle(track)} is already in the download queue — the existing job will be used.`
                             : `${formatTitle(track)} — ${formatArtists(track)}`
                     });
-                    const saveProduced = async (outcome?: any) => {
-                        const result = await saveUrl(`/api/download-file?job=${job}`, formattedTitle, {
-                            signal,
-                            forceNav: mode === 'queue',
-                            onProgress: (received, total) =>
-                                setStatusBar((prev) => ({
-                                    ...prev,
-                                    description: total ? `Saving to disk — ${fmtMB(received)} of ${fmtMB(total)}` : `Saving to disk — ${fmtMB(received)}`,
-                                    progress: total ? Math.max(prev.progress ?? 0, Math.min(99, Math.round((99 * received) / total))) : prev.progress
-                                }))
-                        });
-                        if (result.method === 'aborted') {
-                            axios.post('/api/job-status', { id: job }).catch(() => {});
-                            return resolve();
-                        }
+                    const finishProduced = (outcome?: any) => {
                         addRecentDownload({
                             key: `${source}:${track.id}`,
                             source,
@@ -294,13 +290,56 @@ export const createDownloadJob = async (
                         setStatusBar((prev) => ({ ...prev, progress: 100, description: 'Done — check your downloads' }));
                         resolve();
                     };
+                    const saveProduced = async (outcome?: any) => {
+                        const result = await saveUrl(`/api/download-file?job=${job}`, formattedTitle, {
+                            signal,
+                            forceNav: mode === 'queue',
+                            onProgress: (received, total) =>
+                                setStatusBar((prev) => ({
+                                    ...prev,
+                                    description: total ? `Saving to disk — ${fmtMB(received)} of ${fmtMB(total)}` : `Saving to disk — ${fmtMB(received)}`,
+                                    progress: total ? Math.max(prev.progress ?? 0, Math.min(99, Math.round((99 * received) / total))) : prev.progress
+                                }))
+                        });
+                        if (result.method === 'aborted') {
+                            axios.post('/api/job-status', { id: job }).catch(() => {});
+                            return resolve();
+                        }
+                        finishProduced(outcome);
+                    };
+                    const liveUrl = res.data?.data?.liveUrl;
+                    let liveStarted = false;
+                    let liveStartAttempted = false;
+                    const liveDecisions: Promise<void>[] = [];
+                    const startLiveDownload = () => {
+                        if (!liveUrl || liveStartAttempted || signal.aborted) return;
+                        liveStartAttempted = true;
+                        liveDecisions.push((async () => {
+                            try {
+                                // Probe first so a wrong/expired worker URL falls back
+                                // to the normal published-artifact path instead of
+                                // silently opening a failed browser navigation.
+                                const probe = await fetch(liveUrl, { method: 'HEAD', cache: 'no-store', signal });
+                                if (!probe.ok) return;
+                                await saveUrl(liveUrl, formattedTitle, { signal, forceNav: true });
+                                liveStarted = true;
+                                toast({
+                                    title: 'Fast download started',
+                                    description: 'The finished track is downloading now while its cloud copy is uploaded in parallel.'
+                                });
+                                setStatusBar((prev) => ({ ...prev, description: 'Handing to browser — cloud copy uploading…' }));
+                            } catch {}
+                        })());
+                    };
                     if (mode === 'queue') {
                         try {
-                            const outcome = await watchJob(job, setStatusBar, signal);
+                            const outcome = await watchJob(job, setStatusBar, signal, { onLiveReady: startLiveDownload });
+                            await Promise.allSettled(liveDecisions);
                             if (signal.aborted) return resolve();
                             if (!outcome) throw new Error('download monitoring ended before completion');
                             if (outcome.stage === 'error') throw new Error(outcome.error ?? 'Download failed');
-                            await saveProduced(outcome);
+                            if (liveStarted) finishProduced(outcome);
+                            else await saveProduced(outcome);
                         } catch (e) {
                             axios.post('/api/job-status', { id: job }).catch(() => {});
                             throw e;

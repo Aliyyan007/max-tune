@@ -32,6 +32,8 @@ export async function GET(request: NextRequest) {
                 requeueCount: safe.requeueCount ? Number(safe.requeueCount) : undefined,
                 worker: safe.worker,
                 queuePosition: qp,
+                liveReady: safe.liveReady === '1' || safe.liveReady === 'true' || safe.liveReady === true,
+                liveExpiresAt: safe.liveExpiresAt ? Number(safe.liveExpiresAt) : undefined,
                 resultReady: safe.stage === 'done' && (!!j.resultUrl || !!j.resultB64 || !!j.resultJson),
                 resultExt: safe.stage === 'done' ? safe.resultExt : undefined,
                 resultName: safe.stage === 'done' ? safe.resultName : undefined,

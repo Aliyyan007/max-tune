@@ -9,6 +9,7 @@ import { queueEnabled, enqueueJob, jobGet, jobSet, jobExpire, publicJobView, cmd
 import { cacheEnabled, cacheGet, presignGet, cacheKeyFor } from '@/lib/download-cache';
 import { parseDownloadSpec } from '@/lib/download-spec';
 import { rateLimit, clientIp } from '@/lib/rate-limit';
+import { liveUrlForJob } from '@/lib/live-download';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -93,7 +94,7 @@ export async function POST(request: NextRequest) {
                     throw e;
                 }
             }
-            return NextResponse.json({ success: true, data: { job, mode: 'queue', deduped } });
+            return NextResponse.json({ success: true, data: { job, mode: 'queue', deduped, liveUrl: liveUrlForJob(job) } });
         }
 
         const job = createJob(spec);

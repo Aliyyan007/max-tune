@@ -246,6 +246,15 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
   split. Browser clients use navigation for queue artifacts because cross-origin
   R2 redirects are not fetchable without bucket CORS; do not regress this into
   a `fetch()`-only path.
+- Track workers expose a tokenized `/live/<job>` endpoint only after the output
+  file is completely produced and duration/size-validated. The browser may read
+  that exact finished temp file while `cachePutFile` uploads it to R2 in
+  parallel. This is a complete-artifact fast lane, not partial-object streaming:
+  do not move the handoff earlier into production unless cancellation, partial
+  download failure, backpressure, and container finalization are redesigned
+  deliberately. `WORKER_PUBLIC_URL` and the shared job-encryption secret derive
+  the HMAC URL token; `LIVE_MAX_STREAMS` bounds direct streams and normal R2
+  delivery remains the fallback.
 - The legacy `/api/stream-audio` route performs provider work in the web process
   and is disabled in production unless `ENABLE_LEGACY_STREAM_AUDIO=1`. Keep new
   download work in queue workers.

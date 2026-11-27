@@ -27,6 +27,7 @@ For Qobuz, Deezer, Tidal, Apple Music, and Amazon Music, playback credentials ro
 - **Next.js web service** — UI, metadata/search APIs, request validation, job creation, status, cache-hit redirects.
 - **Redis/Upstash durable queue** — job state in hashes, atomic Lua claim/recovery, worker leases, delayed retries, cancellation, and capability queues (`generic`, `apple`).
 - **Download worker** — separate process/service. Produces audio to temporary files rather than buffering whole tracks in memory, validates duration/container/archive structure, uploads artifacts, and only then marks jobs complete.
+- **Complete-artifact fast lane** — after a track file is fully produced and validated, the worker can serve that exact file directly to the initiating browser while the normal R2 upload continues in parallel. This avoids exposing partially produced media, still preserves the R2 artifact/cache path, and falls back to the usual post-upload redirect when the direct lane is unavailable or expired. It requires `WORKER_PUBLIC_URL` plus the shared job-encryption secret and is bounded by `LIVE_MAX_STREAMS`.
 - **Cloudflare R2 artifact store** — streamed uploads, size/ETag verification, SHA-256 metadata, deterministic recipe cache keys, LRU accounting, and presigned browser delivery.
 - **Album ZIP jobs** — use the same queue/worker/artifact path as single tracks. Archives are written incrementally to disk with valid ZIP central directories and CRCs.
 - **Observability** — `/api/health`, `/api/ready`, `/api/metrics`, `/api/platform-health`, worker `/`, `/ready`, `/metrics`.
@@ -55,10 +56,12 @@ Production queue mode requires R2. Redis-inline media results are a development 
 
 ### Worker scaling
 
-Start with `WORKER_CONCURRENCY=1` on small hosts. Scale horizontally by adding worker instances before increasing concurrency. Use:
+The Render blueprint currently sets `WORKER_CONCURRENCY=3` because download jobs are predominantly network-bound and multi-user FIFO waiting is otherwise severe. Monitor CPU, disk, provider errors, and wrapper stability; horizontal worker instances remain the safer way to scale beyond a small concurrency value. Use:
 
 - `WORKER_CAPS=generic` for normal workers.
 - `WORKER_CAPS=generic,apple` only where `APPLE_WRAPPER_URL` is reachable.
+
+Set `WORKER_PUBLIC_URL` to the worker service's externally reachable base URL (for this deployment, `https://max-tune-worker.onrender.com`) so the web service can hand browsers a tokenized direct-artifact URL. The direct lane is an optimization, not the correctness path: jobs still upload to and verify against R2 before completion.
 
 Workers heartbeat their leases. Crash recovery is automatic; transient network/tool failures retry with backoff. Where a provider legitimately exposes a same-provider preview, entitlement failure degrades to that labeled preview instead of a silent full-track fake; otherwise region/entitlement failures are terminal and explicit.
 
