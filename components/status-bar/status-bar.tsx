@@ -85,7 +85,10 @@ const StatusBar = () => {
                                 </Button>
                             </CardHeader>
                             <CardContent className='flex items-center justify-center gap-2'>
-                                <Progress value={statusBar.progress} />
+                                <Progress value={statusBar.progress} className='transition-all duration-300' />
+                                <span className='w-10 shrink-0 text-right text-xs font-semibold tabular-nums text-muted-foreground'>
+                                    {Math.round(statusBar.progress)}%
+                                </span>
                                 <Button
                                     variant='ghost'
                                     size='icon'

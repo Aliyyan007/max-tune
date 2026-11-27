@@ -542,6 +542,21 @@ export async function retryJob(id: string, error: string, delayMs = 0, token?: s
     await cmd('HINCRBY', 'stats:jobs', 'retried', 1).catch(() => {});
 }
 
+const QUEUE_POSITION_LUA = `
+local q = KEYS[1]
+local id = ARGV[1]
+local idx = redis.call('LPOS', q, id)
+if not idx then return nil end
+local len = redis.call('LLEN', q)
+return len - idx
+`;
+
+export async function queuePosition(id: string, queue: string): Promise<number | undefined> {
+    if (!queueEnabled() || !queue) return undefined;
+    const n = await evalScript(QUEUE_POSITION_LUA, [queue], [id]).catch(() => null);
+    return n == null ? undefined : Number(n);
+}
+
 export async function queueDepths(): Promise<Record<string, number>> {
     if (!queueEnabled()) return {};
     const [generic, apple, inflight] = await Promise.all([

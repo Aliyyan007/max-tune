@@ -8,6 +8,7 @@ interface CacheEntry<T> {
 
 export class ApiCache<T = any> {
     private map: Map<string, CacheEntry<T>>;
+    private inflight = new Map<string, Promise<T>>();
     private bytes = 0;
     constructor(
         private maxBytes: number,
@@ -46,9 +47,15 @@ export class ApiCache<T = any> {
     async wrap(key: string, fn: () => Promise<T>, bytes?: number): Promise<T> {
         const hit = this.get(key);
         if (hit !== undefined) return hit;
-        const v = await fn();
-        this.set(key, v, bytes);
-        return v;
+        const pending = this.inflight.get(key);
+        if (pending) return pending;
+        const p = (async () => {
+            const v = await fn();
+            this.set(key, v, bytes);
+            return v;
+        })().finally(() => this.inflight.delete(key));
+        this.inflight.set(key, p);
+        return p;
     }
 }
 

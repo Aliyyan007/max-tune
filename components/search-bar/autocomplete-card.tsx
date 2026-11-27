@@ -24,7 +24,7 @@ const AutocompleteCard = ({
     const limit = 5;
     return (
         <AnimatePresence>
-            {showCard && searchInput.trim().length > 0 && !searching && results && searchInput.trim() === results.query.trim() && (
+            {showCard && searchInput.trim().length > 1 && !searching && (loading || (results && searchInput.trim() === results.query.trim())) && (
                 <motion.div
                     initial={{ opacity: 0, translateY: -10, zIndex: 1000 }}
                     animate={{
@@ -82,16 +82,15 @@ const AutocompleteCard = ({
                                             <div className='mb-1 capitalize flex items-center md:flex-row flex-col md:items-center md:gap-2 gap-0.5 w-full'>
                                                 <p className='text-sm font-semibold capitalize'>{key}</p>
                                                 <p className='text-xs font-semibold text-muted-foreground capitalize'>
-                                                    Showing {results?.[key as 'albums' | 'tracks'].items.slice(0, limit).length} of
-                                                    {results?.[key as 'albums' | 'tracks'].total}
+                                                    {results
+                                                        ? `Showing ${results[key as 'albums' | 'tracks'].items.slice(0, limit).length} of ${results[key as 'albums' | 'tracks'].total}`
+                                                        : 'Searching…'}
                                                 </p>
                                             </div>
+                                            {!results && [...Array(limit)].map((_, index) => <Skeleton key={index} className='h-4' />)}
                                             {results?.[key as 'albums' | 'tracks'].items.slice(0, limit).map((result: QobuzAlbum | QobuzTrack, index) => {
                                                 const value = `${result.title} - ${getAlbum(result).artist.name}`;
-
-                                                return loading ? (
-                                                    <Skeleton key={index} className='h-4' />
-                                                ) : (
+                                                return (
                                                     <motion.p
                                                         key={index}
                                                         onClick={() => {

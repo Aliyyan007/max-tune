@@ -488,7 +488,7 @@ export function decryptDeezerFile(encrypted: ArrayBuffer | Buffer, sngId: string
 export const deezerAdapter: PlatformAdapter = {
     source: 'deezer',
 
-    async search(query, limit, offset, _ctx) {
+    async search(query, limit, offset, _ctx, light) {
         const results = emptyResults(query);
         // pasted deezer/open links → direct entity lookup
         const m = query.match(/deezer\.com\/(?:\w+\/)?(track|album|artist)\/(\d+)/);
@@ -520,20 +520,22 @@ export const deezerAdapter: PlatformAdapter = {
                 const gwAlbums = (s.ALBUM?.data ?? []).map((a: any) => normGwAlbum(a));
                 const gwArtists = (s.ARTIST?.data ?? []).map((a: any) => normGwArtist(a));
                 // fill album stats + artist release counts via bounded detail calls
-                await Promise.all([
-                    enrichGwTrackAlbums(gwTracks),
-                    mapLimit(gwAlbums, 4, enrichGwAlbum),
-                    // pageSearch ARTIST nodes may omit NB_ALBUM — public /artist
-                    // answers with nb_album in one cheap call (bounded)
-                    mapLimit(
-                        gwArtists.filter((a: any) => a.albums_count == null).slice(0, 12),
-                        4,
-                        async (a: any) => {
-                            const n = (await axios.get(`${PUBLIC_API}/artist/${a.id}`, { timeout: 8000 }).catch(() => null))?.data?.nb_album;
-                            if (n != null) a.albums_count = n;
-                        }
-                    )
-                ]);
+                if (!light) {
+                    await Promise.all([
+                        enrichGwTrackAlbums(gwTracks),
+                        mapLimit(gwAlbums, 4, enrichGwAlbum),
+                        // pageSearch ARTIST nodes may omit NB_ALBUM — public /artist
+                        // answers with nb_album in one cheap call (bounded)
+                        mapLimit(
+                            gwArtists.filter((a: any) => a.albums_count == null).slice(0, 12),
+                            4,
+                            async (a: any) => {
+                                const n = (await axios.get(`${PUBLIC_API}/artist/${a.id}`, { timeout: 8000 }).catch(() => null))?.data?.nb_album;
+                                if (n != null) a.albums_count = n;
+                            }
+                        )
+                    ]);
+                }
                 results.tracks = { limit, offset, total: s.TRACK?.total ?? s.TRACK?.count ?? 0, items: gwTracks };
                 results.albums = { limit, offset, total: s.ALBUM?.total ?? s.ALBUM?.count ?? 0, items: gwAlbums };
                 results.artists = { limit, offset, total: s.ARTIST?.total ?? s.ARTIST?.count ?? 0, items: gwArtists };
@@ -548,7 +550,7 @@ export const deezerAdapter: PlatformAdapter = {
         ]);
         if (tracks.status === 'fulfilled') {
             const items = (tracks.value.data.data ?? []).map((t: any) => normTrack(t));
-            await enrichTrackAlbums(items);
+            if (!light) await enrichTrackAlbums(items);
             results.tracks = {
                 limit,
                 offset,
@@ -558,7 +560,7 @@ export const deezerAdapter: PlatformAdapter = {
         }
         if (albums.status === 'fulfilled') {
             const items = (albums.value.data.data ?? []).map((a: any) => normAlbum(a));
-            await mapLimit(items, 4, enrichAlbum);
+            if (!light) await mapLimit(items, 4, enrichAlbum);
             results.albums = {
                 limit,
                 offset,

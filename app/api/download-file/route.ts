@@ -5,7 +5,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { apiError } from '@/lib/platforms';
 import { createJob, claimJob, streamTaggedTrack, setProgress, stagedFileFor, registerStaged, artifactFilename } from '@/lib/server-download';
-import { queueEnabled, enqueueJob, jobGet, jobSet, jobExpire, publicJobView } from '@/lib/queue';
+import { queueEnabled, enqueueJob, jobGet, jobSet, jobExpire, publicJobView, cmd } from '@/lib/queue';
 import { cacheEnabled, cacheGet, presignGet, cacheKeyFor } from '@/lib/download-cache';
 import { parseDownloadSpec } from '@/lib/download-spec';
 import { rateLimit, clientIp } from '@/lib/rate-limit';
@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
         const spec = parseDownloadSpec(await request.json());
 
         if (queueEnabled()) {
-            const job = crypto.randomBytes(16).toString('hex');
+            let job = crypto.randomBytes(16).toString('hex');
             // cache hit → job is born finished; GET will redirect to the presigned R2 URL
             if (cacheEnabled()) {
                 // Only full-track artifacts are cacheable. Preview objects are
@@ -57,8 +57,43 @@ export async function POST(request: NextRequest) {
                     return NextResponse.json({ success: true, data: { job, cached: true, mode: 'queue' } });
                 }
             }
-            await enqueueJob(job, spec, spec.source, 'track');
-            return NextResponse.json({ success: true, data: { job, mode: 'queue' } });
+
+            const recipeHash = crypto.createHash('sha256').update(cacheKeyFor(spec)).digest('hex');
+            const dedupeKey = `dedupe:track:${recipeHash}`;
+            let deduped = false;
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const existing = await cmd('GET', dedupeKey).catch(() => null);
+                if (existing) {
+                    const [existingJob, existingAtRaw] = String(existing).split(':');
+                    const existingAt = Number(existingAtRaw ?? 0);
+                    const prior = await jobGet(existingJob).catch(() => null);
+                    const priorState = String(prior?.state ?? prior?.stage ?? '');
+                    const freshMissing = !prior && Date.now() - existingAt < 10_000;
+                    if ((prior && priorState !== 'error') || freshMissing) {
+                        job = existingJob;
+                        deduped = true;
+                        break;
+                    }
+                    await cmd('DEL', dedupeKey).catch(() => {});
+                }
+                const reserved = await cmd('SET', dedupeKey, `${job}:${Date.now()}`, 'PX', 30 * 60 * 1000, 'NX').catch(() => null);
+                if (reserved) break;
+                const winner = await cmd('GET', dedupeKey).catch(() => null);
+                if (winner) {
+                    job = String(winner).split(':')[0];
+                    deduped = true;
+                    break;
+                }
+            }
+            if (!deduped) {
+                try {
+                    await enqueueJob(job, spec, spec.source, 'track');
+                } catch (e) {
+                    await cmd('DEL', dedupeKey).catch(() => {});
+                    throw e;
+                }
+            }
+            return NextResponse.json({ success: true, data: { job, mode: 'queue', deduped } });
         }
 
         const job = createJob(spec);

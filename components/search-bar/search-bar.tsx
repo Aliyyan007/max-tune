@@ -28,9 +28,12 @@ const SearchBar = ({
     const [results, setResults] = useState<QobuzSearchResults | null>(null);
     const [loading, setLoading] = useState<boolean>(false);
     const [showCard, setShowCard] = useState(false);
-    const [controller, setController] = useState<AbortController>(new AbortController());
 
     const inputRef = useRef<HTMLInputElement>(null);
+    const abortRef = useRef<AbortController | null>(null);
+    const requestSeq = useRef(0);
+    const inputValueRef = useRef(searchInput);
+    const suggestionCache = useRef(new Map<string, QobuzSearchResults>());
     const { country } = useCountry();
     const { platform } = usePlatform();
 
@@ -39,8 +42,10 @@ const SearchBar = ({
     }, [query]);
 
     useEffect(() => {
-        if (inputRef.current) setSearchInput(inputRef.current.value);
+        inputValueRef.current = searchInput;
+    }, [searchInput]);
 
+    useEffect(() => {
         const handleKeydown = (event: KeyboardEvent) => {
             if (event.ctrlKey && event.key.toLowerCase() === 'k') {
                 event.preventDefault();
@@ -48,48 +53,59 @@ const SearchBar = ({
             }
         };
         window.addEventListener('keydown', handleKeydown);
-
-        return () => {
-            window.removeEventListener('keydown', handleKeydown);
-        };
+        return () => window.removeEventListener('keydown', handleKeydown);
     }, []);
 
     useEffect(() => {
-        if (searching) controller.abort();
+        if (searching) abortRef.current?.abort();
     }, [searching]);
 
-    const fetchResults = async () => {
-        controller.abort();
-        if (searchInput.trim().length === 0) {
+    useEffect(() => {
+        const q = searchInput.trim();
+        const seq = ++requestSeq.current;
+        abortRef.current?.abort();
+        if (q.length < 2) {
+            setResults(null);
+            setLoading(false);
             return;
         }
 
         setLoading(true);
+        const timer = setTimeout(async () => {
+            const cacheKey = `${platform}:${country ?? ''}:${q.toLowerCase()}`;
+            const cached = suggestionCache.current.get(cacheKey);
+            if (cached) {
+                if (seq === requestSeq.current) {
+                    setResults(cached);
+                    setLoading(false);
+                }
+                return;
+            }
 
-        const newController = new AbortController();
-        setController(newController);
+            const controller = new AbortController();
+            abortRef.current = controller;
+            try {
+                const response = await axios.get(`/api/get-music?q=${encodeURIComponent(q)}&offset=0&limit=6&light=1&source=${platform}`, {
+                    headers: {
+                        'Token-Country': country,
+                        ...serviceHeaders()
+                    },
+                    signal: controller.signal
+                });
+                if (response.status === 200 && seq === requestSeq.current && inputValueRef.current.trim() === q) {
+                    const data = response.data.data as QobuzSearchResults;
+                    suggestionCache.current.set(cacheKey, data);
+                    if (suggestionCache.current.size > 80) suggestionCache.current.delete(suggestionCache.current.keys().next().value!);
+                    setResults(data);
+                }
+            } catch {
+            } finally {
+                if (seq === requestSeq.current) setLoading(false);
+            }
+        }, 160);
 
-        try {
-            setTimeout(async () => {
-                try {
-                    const response = await axios.get(`/api/get-music?q=${searchInput}&offset=0&source=${platform}`, {
-                        headers: {
-                            'Token-Country': country,
-                            ...serviceHeaders()
-                        },
-                        signal: newController.signal
-                    });
-                    if (response.status === 200) setResults(response.data.data);
-                } catch {}
-            }, 200);
-        } catch {}
-
-        setLoading(false);
-    };
-
-    useEffect(() => {
-        fetchResults();
-    }, [searchInput]);
+        return () => clearTimeout(timer);
+    }, [searchInput, platform, country]);
 
     return (
         <div className='flex items-center gap-2 relative'>
@@ -107,11 +123,8 @@ const SearchBar = ({
                     placeholder='Search for anything...'
                     value={searchInput}
                     autoComplete='off'
-                    onFocus={(event: React.FocusEvent<HTMLInputElement>) => {
-                        setShowCard(true);
-                        if (event.currentTarget.value.trim().length > 0) fetchResults();
-                    }}
-                    onBlur={() => setTimeout(() => setShowCard(false), 50)}
+                    onFocus={() => setShowCard(true)}
+                    onBlur={() => setTimeout(() => setShowCard(false), 80)}
                     onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
                         const target = event.currentTarget as HTMLInputElement;
                         if (event.key === 'Enter') {

@@ -498,7 +498,7 @@ async function amazonSearchAnon(query: string, limit: number): Promise<QobuzTrac
 export const amazonAdapter: PlatformAdapter = {
     source: 'amazon',
 
-    async search(query, limit, offset, ctx) {
+    async search(query, limit, offset, ctx, light) {
         const results = emptyResults(query);
         const token = await amazonToken(ctx);
         if (token) {
@@ -513,14 +513,14 @@ export const amazonAdapter: PlatformAdapter = {
                 // track.album stubs lack duration/date/tracks — fill per unique album (bounded)
                 const trackAlbums = new Map<string, any>();
                 for (const t of items) if (t?.album?.id && !trackAlbums.has(String(t.album.id))) trackAlbums.set(String(t.album.id), t.album);
-                await mapLimit([...trackAlbums.keys()], 4, (id) => enrichAmazonAlbum(trackAlbums.get(id)!, token));
+                if (!light) await mapLimit([...trackAlbums.keys()], 4, (id) => enrichAmazonAlbum(trackAlbums.get(id)!, token));
                 for (const t of items) if (t?.album?.released_at && !t.released_at) t.released_at = t.album.released_at;
                 results.tracks = { limit, offset, total: items.length ? Math.max(items.length, offset + items.length + limit) : 0, items: items.slice(offset, offset + limit) };
             }
             if (albums.status === 'fulfilled' && albums.value) {
                 const items = collect(albums.value, normAmazonAlbum, 50).slice(offset, offset + limit);
                 // search nodes carry no duration — enrich the returned page via album detail
-                await mapLimit(items, 4, (alb: any) => enrichAmazonAlbum(alb, token));
+                if (!light) await mapLimit(items, 4, (alb: any) => enrichAmazonAlbum(alb, token));
                 results.albums = { limit, offset, total: items.length === limit ? offset + items.length + limit : offset + items.length, items };
             }
             if (artists.status === 'fulfilled' && artists.value) {

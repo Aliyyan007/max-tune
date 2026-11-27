@@ -5,7 +5,7 @@ import { Zip, AsyncZipDeflate } from 'fflate';
 import { adapters, apiError } from '@/lib/platforms';
 import { stageToFile, specFromTrack, normalizeArtUrl, setProgress, getProgress, pipelineSlots, fetchArtworkBuf } from '@/lib/server-download';
 import type { PlatformSource, ServiceTokens } from '@/lib/platforms/types';
-import { queueEnabled, enqueueJob, jobGet, jobSet, jobExpire, publicJobView } from '@/lib/queue';
+import { queueEnabled, enqueueJob, jobGet, jobSet, jobExpire, publicJobView, cmd } from '@/lib/queue';
 import { cacheEnabled, cacheGet, presignGet, zipCacheKeyFor } from '@/lib/download-cache';
 import { parseAlbumZipSpec } from '@/lib/download-spec';
 import { rateLimit, clientIp } from '@/lib/rate-limit';
@@ -47,7 +47,7 @@ export async function POST(request: NextRequest) {
             return apiError(new Error('too many album zip jobs — slow down'), 429);
         }
         const spec = parseAlbumZipSpec(await request.json());
-        const id = crypto.randomBytes(16).toString('hex');
+        let id = crypto.randomBytes(16).toString('hex');
         if (queueEnabled()) {
             if (cacheEnabled()) {
                 // Preview-containing archives are job-scoped, not reusable cache
@@ -66,8 +66,42 @@ export async function POST(request: NextRequest) {
                     return NextResponse.json({ success: true, data: { job: id, cached: true, mode: 'queue' } });
                 }
             }
-            await enqueueJob(id, spec, spec.source, 'zip');
-            return NextResponse.json({ success: true, data: { job: id, mode: 'queue' } });
+            const recipeHash = crypto.createHash('sha256').update(zipCacheKeyFor(spec)).digest('hex');
+            const dedupeKey = `dedupe:zip:${recipeHash}`;
+            let deduped = false;
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const existing = await cmd('GET', dedupeKey).catch(() => null);
+                if (existing) {
+                    const [existingJob, existingAtRaw] = String(existing).split(':');
+                    const existingAt = Number(existingAtRaw ?? 0);
+                    const prior = await jobGet(existingJob).catch(() => null);
+                    const priorState = String(prior?.state ?? prior?.stage ?? '');
+                    const freshMissing = !prior && Date.now() - existingAt < 10_000;
+                    if ((prior && priorState !== 'error') || freshMissing) {
+                        id = existingJob;
+                        deduped = true;
+                        break;
+                    }
+                    await cmd('DEL', dedupeKey).catch(() => {});
+                }
+                const reserved = await cmd('SET', dedupeKey, `${id}:${Date.now()}`, 'PX', 2 * 60 * 60 * 1000, 'NX').catch(() => null);
+                if (reserved) break;
+                const winner = await cmd('GET', dedupeKey).catch(() => null);
+                if (winner) {
+                    id = String(winner).split(':')[0];
+                    deduped = true;
+                    break;
+                }
+            }
+            if (!deduped) {
+                try {
+                    await enqueueJob(id, spec, spec.source, 'zip');
+                } catch (e) {
+                    await cmd('DEL', dedupeKey).catch(() => {});
+                    throw e;
+                }
+            }
+            return NextResponse.json({ success: true, data: { job: id, mode: 'queue', deduped } });
         }
         zipJobs.set(id, { spec, at: Date.now() });
         setProgress(id, { stage: 'queued' });

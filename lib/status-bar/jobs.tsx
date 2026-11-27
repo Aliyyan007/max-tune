@@ -14,7 +14,9 @@ export async function createJob(
     setStatusBar: React.Dispatch<React.SetStateAction<StatusBarProps>>,
     QueueTitle: string,
     QueueIcon: LucideIcon,
-    ready: () => Promise<void>
+    ready: () => Promise<void>,
+    onQueuedRemove?: () => void,
+    onQueuedLocally?: () => void
 ) {
     let running;
     const UUID = uuidv4();
@@ -22,6 +24,7 @@ export async function createJob(
     const updateJob = async () => {
         const statusBar: StatusBarProps = await loadStatusBarValue(setStatusBar);
         if (statusBar!.processing) {
+            onQueuedLocally?.();
             setStatusBar((prev) => ({
                 ...prev,
                 queue: [
@@ -32,6 +35,7 @@ export async function createJob(
                         icon: QueueIcon,
                         remove: () => {
                             jobs = jobs.filter((item) => item.UUID !== UUID);
+                            onQueuedRemove?.();
                         }
                     }
                 ]

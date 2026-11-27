@@ -233,6 +233,13 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
   audio credentials contribute only an opaque credential-scope hash so one
   user's entitled artifact cannot become another user's cache hit. Pool/env
   credential jobs intentionally share the pool-scoped cache.
+- Track and album-zip POSTs reserve short-lived Redis dedupe keys derived from
+  those output recipes; duplicate browser/client submissions attach to the
+  existing job instead of occupying another queue slot. Autocomplete searches
+  pass `light=1`, which skips nonessential per-item enrichment; submitted
+  searches render light rows first and merge the fully enriched response when
+  it arrives. Homepage "recently downloaded" entries are browser-local
+  localStorage metadata, not a server-wide history.
 - Queue-mode GET endpoints are intentionally non-blocking. Clients poll
   `/api/job-status` and only call GET after `stage=done`; the GET redirects to
   a freshly presigned artifact URL. Long-polling the web service defeats the

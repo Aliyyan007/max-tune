@@ -1788,7 +1788,7 @@ export async function streamTaggedTrack(spec: DownloadSpec, jobId?: string, sign
 
 // ------------------ job progress ------------------
 export interface JobProgress {
-    stage: 'queued' | 'resolving' | 'downloading' | 'processing' | 'sending' | 'done' | 'error';
+    stage: 'queued' | 'resolving' | 'downloading' | 'processing' | 'uploading' | 'sending' | 'done' | 'error';
     received: number;
     sent: number;
     total?: number;

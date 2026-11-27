@@ -285,7 +285,7 @@ const totalHint = (count: number, limit: number, offset: number) => (count === l
 export const appleAdapter: PlatformAdapter = {
     source: 'apple',
 
-    async search(query, limit, offset, ctx) {
+    async search(query, limit, offset, ctx, light) {
         const results = emptyResults(query);
         const m = query.match(/music\.apple\.com\/\w+\/(album|song|artist)(?:\/[^/]+)?\/(\d+)/);
         if (m && offset === 0) {
@@ -331,7 +331,7 @@ export const appleAdapter: PlatformAdapter = {
                 const amAlbums = (rs.albums?.data ?? []).map((x: any) => normAmAlbum(x));
                 const amArtists = (rs.artists?.data ?? []).map((x: any) => normAmArtist(x));
                 // catalog items carry no album duration/artist ids — bounded detail fills
-                await Promise.all([
+                if (!light) await Promise.all([
                     enrichAmTrackAlbums(amTracks, ctx),
                     enrichAmArtistIds(amTracks, ctx),
                     enrichAmAlbumBatch(amAlbums, ctx),
@@ -370,7 +370,7 @@ export const appleAdapter: PlatformAdapter = {
             const items = (songs.value.data.results ?? []).filter((r: any) => r.wrapperType === 'track').map((t: any) => normTrack(t));
             const trackAlbums = new Map<string, any>();
             for (const t of items) if (t?.album?.id && !trackAlbums.has(String(t.album.id))) trackAlbums.set(String(t.album.id), t.album);
-            await mapLimit([...trackAlbums.keys()], 4, async (id) => {
+            if (!light) await mapLimit([...trackAlbums.keys()], 4, async (id) => {
                 const alb = trackAlbums.get(id)!;
                 alb.duration = await albumDuration(id).catch(() => 0);
             });
@@ -378,7 +378,7 @@ export const appleAdapter: PlatformAdapter = {
         }
         if (albums.status === 'fulfilled') {
             const items = (albums.value.data.results ?? []).filter((r: any) => r.collectionType === 'Album').map((a: any) => normAlbum(a));
-            await mapLimit(items, 4, async (alb: any) => {
+            if (!light) await mapLimit(items, 4, async (alb: any) => {
                 alb.duration = await albumDuration(alb.id).catch(() => 0);
             });
             results.albums = { limit, offset, total: totalHint(items.length, limit, offset), items };
@@ -387,7 +387,7 @@ export const appleAdapter: PlatformAdapter = {
             const items = (artists.value.data.results ?? []).map((a: any) =>
                 baseArtist({ source: 'apple', id: a.artistId, name: a.artistName ?? '', image: null })
             );
-            await mapLimit(items, 4, async (a: any) => {
+            if (!light) await mapLimit(items, 4, async (a: any) => {
                 const r = await axios.get(`${ITUNES}/lookup`, { params: { id: a.id, entity: 'album', limit: 200 }, timeout: 15000 }).catch(() => null);
                 const n = (r?.data?.results ?? []).filter((x: any) => x.wrapperType === 'collection').length;
                 if (n) a.albums_count = n;

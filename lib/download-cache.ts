@@ -5,6 +5,7 @@
 // usage; PUTs over CACHE_MAX_BYTES evict least-recently-served objects.
 import crypto from 'crypto';
 import fs from 'fs';
+import { Transform, pipeline } from 'stream';
 import {
     queueEnabled, cacheTouch, cacheAddBytes, cacheSubBytes, cacheTotal,
     cacheMetaReserve, cacheMetaGet, cacheMetaDel, cacheOldest, cacheIndexDel
@@ -336,7 +337,12 @@ async function putWithRetry(args: {
     if (!ok) throw lastErr ?? new Error('r2 put failed');
 }
 
-export async function cachePutFile(objectKey: string, file: string, expectedSize?: number): Promise<{ size: number; sha256: string; etag?: string }> {
+export async function cachePutFile(
+    objectKey: string,
+    file: string,
+    expectedSize?: number,
+    onProgress?: (uploaded: number, total: number) => void
+): Promise<{ size: number; sha256: string; etag?: string }> {
     if (!cacheEnabled()) throw new Error('r2 cache not configured');
     const hashes = await fileHashes(file);
     if (expectedSize !== undefined && hashes.size !== expectedSize) throw new Error(`staged artifact size mismatch: ${hashes.size} != ${expectedSize}`);
@@ -344,7 +350,24 @@ export async function cachePutFile(objectKey: string, file: string, expectedSize
         objectKey,
         size: hashes.size,
         payloadHash: hashes.sha256,
-        makeBody: () => fs.createReadStream(file, { highWaterMark: 1 << 20 }) as any
+        makeBody: () => {
+            const source = fs.createReadStream(file, { highWaterMark: 1 << 20 });
+            if (!onProgress) return source as any;
+            let uploaded = 0;
+            const counter = new Transform({
+                highWaterMark: 1 << 20,
+                transform(chunk: Buffer, _enc, cb) {
+                    uploaded += chunk.length;
+                    onProgress(uploaded, hashes.size);
+                    this.push(chunk);
+                    cb();
+                }
+            });
+            pipeline(source, counter, (err) => {
+                if (err) counter.destroy(err);
+            });
+            return counter as any;
+        }
     });
     const head = await objectHead(objectKey);
     if (!head || head.size !== hashes.size) {

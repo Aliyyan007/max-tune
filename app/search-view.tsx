@@ -17,6 +17,7 @@ import { useTheme } from 'next-themes';
 import CountryPicker from '@/components/country-picker';
 import { useCountry } from '@/lib/country-provider';
 import PlatformPicker from '@/components/platform-picker';
+import RecentDownloads from '@/components/recent-downloads';
 import { usePlatform } from '@/lib/platform-provider';
 import { serviceHeaders } from '@/lib/service-tokens';
 
@@ -38,6 +39,30 @@ export const filterData: FilterDataType = [
     }
 ];
 
+function withEmptySections(data: QobuzSearchResults): QobuzSearchResults {
+    const next = { ...data } as any;
+    for (const filter of filterData) {
+        if (!next[filter.value]) next[filter.value] = { total: 0, offset: 0, limit: 0, items: [] };
+    }
+    return next;
+}
+
+function mergeEnrichedResults(previous: QobuzSearchResults | null, incoming: QobuzSearchResults): QobuzSearchResults {
+    if (!previous || previous.query !== incoming.query) return incoming;
+    const merged = { ...incoming } as any;
+    for (const filter of filterData) {
+        const priorItems = (previous as any)[filter.value]?.items ?? [];
+        const freshItems = (incoming as any)[filter.value]?.items ?? [];
+        if (priorItems.length > freshItems.length) {
+            merged[filter.value] = {
+                ...(incoming as any)[filter.value],
+                items: [...freshItems, ...priorItems.slice(freshItems.length)]
+            };
+        }
+    }
+    return merged;
+}
+
 const SearchView = () => {
     const { resolvedTheme } = useTheme();
     const [results, setResults] = useState<QobuzSearchResults | null>(null);
@@ -46,6 +71,7 @@ const SearchView = () => {
     const [loading, setLoading] = useState<boolean>(false);
     const [searching, setSearching] = useState<boolean>(false);
     const [searchError, setSearchError] = useState<string>('');
+    const searchSeq = useRef(0);
     const { settings } = useSettings();
     const { country } = useCountry();
     const { platform } = usePlatform();
@@ -219,39 +245,47 @@ const SearchView = () => {
     }, [logoAnimationControls, mounted, logoSrc]);
 
     const onSearch = async (query: string, searchFieldInput: string = searchField) => {
+        const seq = ++searchSeq.current;
         setQuery(query);
         setSearchError('');
         const filter = filterData.find((filter) => filter.value === searchFieldInput) || filterData[0];
+        const headers = {
+            'Token-Country': country,
+            ...serviceHeaders()
+        };
+        const url = `/api/${filter.searchRoute ? filter.searchRoute : 'get-music'}?q=${encodeURIComponent(query)}&offset=0&source=${platform}`;
+        // Render the light catalog response as soon as it lands, then replace it
+        // with the fully enriched rows in-place. Detail enrichment can legitimately
+        // take several seconds on some providers and should not leave the page blank.
+        const fullRequest = axios.get(url, { headers });
+        fullRequest.catch(() => {}); // a superseded search must not surface as an unhandled rejection
+        let quickSet = false;
         try {
-            const response = await axios.get(`/api/${filter.searchRoute ? filter.searchRoute : 'get-music'}?q=${query}&offset=0&source=${platform}`, {
-                headers: {
-                    'Token-Country': country,
-                    ...serviceHeaders()
-                }
-            });
+            if (!filter.searchRoute) {
+                try {
+                    const quickResponse = await axios.get(`${url}&light=1`, { headers });
+                    if (seq !== searchSeq.current) return;
+                    if (quickResponse.status === 200) {
+                        quickSet = true;
+                        setLoading(false);
+                        if (searchField !== searchFieldInput) setSearchField(searchFieldInput as QobuzSearchFilters);
+                        setResults(withEmptySections(quickResponse.data.data));
+                        setSearching(false);
+                    }
+                } catch {}
+            }
+            const response = await fullRequest;
+            if (seq !== searchSeq.current) return;
             if (response.status === 200) {
                 setLoading(false);
                 if (searchField !== searchFieldInput) setSearchField(searchFieldInput as QobuzSearchFilters);
-
-                let newResults = { ...response.data.data };
-                filterData.map((filter) => {
-                    if (!newResults[filter.value])
-                        newResults = {
-                            ...newResults,
-                            [filter.value]: {
-                                total: undefined,
-                                offset: undefined,
-                                limit: undefined,
-                                items: []
-                            }
-                        };
-                });
-                setResults(newResults);
+                const enriched = withEmptySections(response.data.data);
+                setResults((previous) => mergeEnrichedResults(previous, enriched));
             }
         } catch (error: any) {
-            setSearchError(error?.response.data?.error || error.message || 'An error occurred.');
+            if (seq === searchSeq.current && !quickSet) setSearchError(error?.response.data?.error || error.message || 'An error occurred.');
         }
-        setSearching(false);
+        if (seq === searchSeq.current) setSearching(false);
     };
 
     useEffect(() => {
@@ -332,6 +366,8 @@ const SearchView = () => {
                     )}
                 </div>
             </div>
+
+            {!query && !results && <RecentDownloads />}
 
             <div>
                 {results && (

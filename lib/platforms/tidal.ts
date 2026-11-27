@@ -443,11 +443,12 @@ export async function resolveTidalPreview(trackId: string): Promise<{ url: strin
 export const tidalAdapter: PlatformAdapter = {
     source: 'tidal',
 
-    async search(query, limit, offset, ctx) {
+    async search(query, limit, offset, ctx, light) {
         const results = emptyResults(query);
         let countryCode = 'US';
         const token = ctx.tokens.tidalToken || process.env.TIDAL_ACCESS_TOKEN;
-        if (token) countryCode = (await getTidalSession(ctx).catch(() => ({ countryCode: 'US' }))).countryCode;
+        if (token && !light) countryCode = (await getTidalSession(ctx).catch(() => ({ countryCode: 'US' }))).countryCode;
+        else if (ctx.country) countryCode = ctx.country;
         const m = query.match(/tidal\.com\/(?:browse\/)?(track|album|artist)\/(\d+)/);
         if (m) {
             try {
@@ -473,12 +474,12 @@ export const tidalAdapter: PlatformAdapter = {
         });
         const d = res.data;
         const trackItems = (d.tracks?.items ?? []).map((t: any) => normTrack(t));
-        await enrichTrackAlbums(trackItems, countryCode);
+        if (!light) await enrichTrackAlbums(trackItems, countryCode);
         results.tracks = { limit, offset, total: d.tracks?.totalNumberOfItems ?? 0, items: trackItems };
         results.albums = { limit, offset, total: d.albums?.totalNumberOfItems ?? 0, items: (d.albums?.items ?? []).map((a: any) => normAlbum(a)) };
         const artistItems = (d.artists?.items ?? []).map((a: any) => normArtist(a));
         // search artist nodes carry no release count — one light call per card
-        await mapLimit(artistItems, 4, async (a: any) => {
+        if (!light) await mapLimit(artistItems, 4, async (a: any) => {
             const r = await axios
                 .get(`${BASE}/artists/${a.id}/albums`, { params: { countryCode, limit: 1 }, headers: await catalogHeaders(), timeout: 15000 })
                 .catch(() => null);

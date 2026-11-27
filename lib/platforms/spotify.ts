@@ -328,7 +328,7 @@ function normArtist(a: any, releaseCount?: number) {
 const spotifyAdapter: PlatformAdapter = {
     source: 'spotify',
 
-    async search(query, limit, offset, ctx) {
+    async search(query, limit, offset, ctx, light) {
         const results = emptyResults(query);
         const urlMatch = query.match(/open\.spotify\.com\/(track|album|artist)\/([A-Za-z0-9]+)/);
         if (urlMatch && offset === 0) {
@@ -389,7 +389,7 @@ const spotifyAdapter: PlatformAdapter = {
                     // also hand back the full tracklist: piggyback positions.
                     const trackAlbums = new Map<string, any>();
                     for (const t of trackItems) if (t?.album?.id && !trackAlbums.has(String(t.album.id))) trackAlbums.set(String(t.album.id), t.album);
-                    await mapLimit([...trackAlbums.keys()], 4, async (id) => {
+                    if (!light) await mapLimit([...trackAlbums.keys()], 4, async (id) => {
                         const alb = trackAlbums.get(id)!;
                         const d = await pf('getAlbum', { uri: `spotify:album:${id}`, locale: '', offset: 0, limit: 50 }).catch(() => null);
                         const au = d?.data?.albumUnion;
@@ -414,7 +414,7 @@ const spotifyAdapter: PlatformAdapter = {
                     for (const t of trackItems) if (t?.album?.released_at && !t.released_at) t.released_at = t.album.released_at;
                     results.tracks = { limit, offset, total: sk.tracks?.totalCount ?? 0, items: trackItems };
                     const albumItems = (sk.albums?.items ?? []).map((a: any) => normPfAlbum(a));
-                    await mapLimit(albumItems, 4, async (alb: any) => {
+                    if (!light) await mapLimit(albumItems, 4, async (alb: any) => {
                         const d = await pf('getAlbum', { uri: `spotify:album:${alb.id}`, locale: '', offset: 0, limit: 50 }).catch(() => null);
                         const au = d?.data?.albumUnion;
                         const tl = au?.tracksV2?.items ?? [];
@@ -428,7 +428,7 @@ const spotifyAdapter: PlatformAdapter = {
                     const artistItems = (sk.artists?.items ?? []).map((a: any) => normPfArtist(a));
                     // release counts are one queryArtistOverview call each — bounded
                     // so cards can show "N Releases" like Qobuz instead of "Releases"
-                    if (!pfOpDead('queryArtistOverview')) {
+                    if (!light && !pfOpDead('queryArtistOverview')) {
                         await mapLimit(artistItems.slice(0, 12), 3, async (a: any) => {
                             const r = await pf('queryArtistOverview', { uri: `spotify:artist:${a.id}`, locale: '', includePrerelease: false }).catch(() => null);
                             const d = r?.data?.artistUnion?.discography;
@@ -454,7 +454,7 @@ const spotifyAdapter: PlatformAdapter = {
         const trackItems = tracks.map((t: any) => normTrack(t));
         const trackAlbums = new Map<string, any>();
         for (const t of trackItems) if (t?.album?.id && !trackAlbums.has(String(t.album.id))) trackAlbums.set(String(t.album.id), t.album);
-        await mapLimit([...trackAlbums.keys()], 4, async (id) => {
+        if (!light) await mapLimit([...trackAlbums.keys()], 4, async (id) => {
             const alb = trackAlbums.get(id)!;
             const a = await api(`/albums/${id}`, {}, ctx, 0).catch(() => null);
             if (!a?.id) return;
@@ -468,13 +468,13 @@ const spotifyAdapter: PlatformAdapter = {
         for (const t of trackItems) if (t?.album?.released_at && !t.released_at) t.released_at = t.album.released_at;
         results.tracks = { limit, offset, total: data?.tracks?.total ?? 0, items: trackItems };
         const albumItems = albums.map((a: any) => normAlbum(a));
-        await mapLimit(albumItems, 4, async (alb: any) => {
+        if (!light) await mapLimit(albumItems, 4, async (alb: any) => {
             const a = await api(`/albums/${alb.id}`, {}, ctx, 0).catch(() => null);
             if (a?.tracks?.items) alb.duration = Math.round(a.tracks.items.reduce((s: number, t: any) => s + (t?.duration_ms ?? 0), 0) / 1000);
         });
         results.albums = { limit, offset, total: data?.albums?.total ?? 0, items: albumItems };
         const artistItems = artists.map((a: any) => normArtist(a));
-        await mapLimit(artistItems, 4, async (a: any) => {
+        if (!light) await mapLimit(artistItems, 4, async (a: any) => {
             const r = await api(`/artists/${a.id}/albums`, { limit: 1 }, ctx).catch(() => null);
             if (r?.total != null) a.albums_count = r.total;
         });

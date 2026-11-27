@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getProgress, setProgress } from '@/lib/server-download';
-import { queueEnabled, jobGet, requestCancel, publicJobView, cancelRequested } from '@/lib/queue';
+import { queueEnabled, jobGet, requestCancel, publicJobView, cancelRequested, queuePosition } from '@/lib/queue';
 import { apiError } from '@/lib/platforms';
 
 export const runtime = 'nodejs';
@@ -17,6 +17,7 @@ export async function GET(request: NextRequest) {
             const safe = publicJobView(j);
             const resultMeta = j.resultJson && typeof j.resultJson === 'object' ? j.resultJson : {};
             const isPreview = resultMeta.isPreview === true || resultMeta.isPreview === '1' || resultMeta.isPreview === 'true';
+            const qp = (safe.stage ?? 'queued') === 'queued' ? await queuePosition(id, String(safe.queue ?? '')) : undefined;
             const data = {
                 stage: safe.stage ?? 'queued',
                 state: safe.state ?? safe.stage ?? 'queued',
@@ -30,6 +31,7 @@ export async function GET(request: NextRequest) {
                 attempt: safe.attempt ? Number(safe.attempt) : undefined,
                 requeueCount: safe.requeueCount ? Number(safe.requeueCount) : undefined,
                 worker: safe.worker,
+                queuePosition: qp,
                 resultReady: safe.stage === 'done' && (!!j.resultUrl || !!j.resultB64 || !!j.resultJson),
                 resultExt: safe.stage === 'done' ? safe.resultExt : undefined,
                 resultName: safe.stage === 'done' ? safe.resultName : undefined,

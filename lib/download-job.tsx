@@ -9,6 +9,7 @@ import { outputFor, SettingsProps } from './settings-provider';
 import { StatusBarProps } from '@/components/status-bar/status-bar';
 import { ToastAction } from '@/components/ui/toast';
 import { saveUrl } from './browser-save';
+import { addRecentDownload } from './recent-downloads';
 
 const sourceOf = (obj: any): string => obj?.source ?? 'qobuz';
 
@@ -23,14 +24,21 @@ const errDesc = (e: any): string => {
 };
 
 const fmtMB = (n: number) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`);
+const fmtETA = (seconds: number) => {
+    if (!Number.isFinite(seconds) || seconds < 1) return '';
+    if (seconds < 60) return `${Math.ceil(seconds)}s left`;
+    return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s left`;
+};
+const activeTrackDownloads = new Set<string>();
 
-type Stage = 'queued' | 'resolving' | 'downloading' | 'processing' | 'sending' | 'done' | 'error';
+type Stage = 'queued' | 'resolving' | 'downloading' | 'processing' | 'uploading' | 'sending' | 'done' | 'error';
 const STAGE_TEXT: Record<Stage, string> = {
     queued: 'Queued…',
     resolving: 'Resolving source…',
     downloading: 'Fetching audio…',
     processing: 'Tagging & embedding artwork…',
-    sending: 'Pushing to browser…',
+    uploading: 'Uploading artifact…',
+    sending: 'Handing to browser…',
     done: 'Done — check your downloads',
     error: 'Failed'
 };
@@ -41,24 +49,61 @@ const STAGE_TEXT: Record<Stage, string> = {
 function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateAction<StatusBarProps>>, signal: AbortSignal): Promise<any | false> {
     return new Promise((resolve) => {
         let lastStage = '';
+        let lastBytes = 0;
+        let lastBytesAt = 0;
+        let lastBytesStage = '';
+        let smoothSpeed = 0;
+        const startedAt = Date.now();
         const poll = async () => {
             if (signal.aborted) return resolve(false);
             try {
                 const res = await axios.get('/api/job-status', { params: { id: jobId }, signal });
                 const p = res.data?.data;
-                if (!p) return resolve(false); // aged out — Chrome already has it
-                if (p.stage !== lastStage || p.stage === 'downloading' || p.stage === 'sending') {
+                if (!p) {
+                    if (Date.now() - startedAt < 6000) {
+                        setTimeout(poll, 500);
+                        return;
+                    }
+                    return resolve(false); // aged out — Chrome already has it
+                }
+                if (p.stage !== lastStage || ['downloading', 'uploading', 'sending', 'queued'].includes(p.stage)) {
                     lastStage = p.stage;
                     let desc = STAGE_TEXT[p.stage as Stage] ?? p.stage;
-                    if (p.label) desc = p.label;
+                    if (p.stage === 'queued' && p.queuePosition) desc = `Queued — position ${p.queuePosition}`;
                     else if (p.stage === 'downloading' && p.received) desc = `Fetching audio — ${fmtMB(p.received)}${p.total ? ` of ${fmtMB(p.total)}` : ''}`;
-                    else if (p.stage === 'sending' && p.sent) desc = `Pushing to browser — ${fmtMB(p.sent)}${p.total ? ` of ${fmtMB(p.total)}` : ''}`;
-                    // progress: downloaded share (0-70) + sent share pushes to 95+
-                    let pct = 5;
-                    if (p.stage === 'resolving') pct = 12;
-                    else if (p.stage === 'downloading') pct = p.total ? 15 + Math.round((70 * p.received) / p.total) : Math.min(70, 15 + Math.round(p.received / 524288));
-                    else if (p.stage === 'processing') pct = 85;
-                    else if (p.stage === 'sending') pct = p.total ? 70 + Math.round((25 * p.sent) / Math.max(p.total, p.sent)) : 92;
+                    else if (p.stage === 'uploading' && p.sent) desc = `Uploading artifact — ${fmtMB(p.sent)}${p.total ? ` of ${fmtMB(p.total)}` : ''}`;
+                    else if (p.stage === 'sending' && p.sent) desc = `Handing to browser — ${fmtMB(p.sent)}${p.total ? ` of ${fmtMB(p.total)}` : ''}`;
+                    if (['downloading', 'uploading', 'sending'].includes(p.stage)) {
+                        const byteCount = Number(p.stage === 'downloading' ? p.received ?? 0 : p.sent ?? 0);
+                        const total = Number(p.total ?? 0);
+                        const now = Date.now();
+                        if (lastBytesStage !== p.stage) {
+                            lastBytes = 0;
+                            lastBytesAt = 0;
+                            smoothSpeed = 0;
+                            lastBytesStage = p.stage;
+                        }
+                        if (lastBytesAt && byteCount > lastBytes) {
+                            const instantSpeed = (byteCount - lastBytes) / Math.max((now - lastBytesAt) / 1000, 0.1);
+                            smoothSpeed = smoothSpeed ? smoothSpeed * 0.65 + instantSpeed * 0.35 : instantSpeed;
+                            lastBytes = byteCount;
+                            lastBytesAt = now;
+                        } else if (!lastBytesAt && byteCount > 0) {
+                            lastBytes = byteCount;
+                            lastBytesAt = now;
+                        }
+                        if (smoothSpeed > 1024) {
+                            desc += ` · ${fmtMB(smoothSpeed)}/s`;
+                            const eta = total > byteCount ? fmtETA((total - byteCount) / smoothSpeed) : '';
+                            if (eta) desc += ` · ${eta}`;
+                        }
+                    }
+                    let pct = 4;
+                    if (p.stage === 'resolving') pct = 10;
+                    else if (p.stage === 'downloading') pct = p.total ? 12 + Math.round((50 * p.received) / p.total) : Math.min(60, 12 + Math.round(p.received / 524288));
+                    else if (p.stage === 'processing') pct = 68;
+                    else if (p.stage === 'uploading') pct = p.total ? 72 + Math.round((23 * p.sent) / Math.max(p.total, p.sent)) : 78;
+                    else if (p.stage === 'sending') pct = p.total ? 95 + Math.round((4 * p.sent) / Math.max(p.total, p.sent)) : 97;
                     else if (p.stage === 'done') pct = 100;
                     setStatusBar((prev) => ({ ...prev, progress: Math.min(pct, 100), description: desc }));
                 }
@@ -67,8 +112,12 @@ function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateActi
                     setStatusBar((prev) => ({ ...prev, description: p.error ?? 'Download failed' }));
                     return resolve(p);
                 }
-            } catch {}
-            setTimeout(poll, 350);
+                setTimeout(poll, p.stage === 'queued' ? 700 : 350);
+                return;
+            } catch (e) {
+                if (e instanceof AxiosError && e.response?.status === 404 && Date.now() - startedAt > 6000) return resolve(false);
+            }
+            setTimeout(poll, 700);
         };
         poll();
     });
@@ -79,7 +128,7 @@ function watchJob(jobId: string, setStatusBar: React.Dispatch<React.SetStateActi
 // Memoized per album id — N tracks from one album used to fire N sequential calls
 // before each job was even created.
 const albumEnrichP = new Map<string, Promise<void>>();
-async function enrichAlbum(result: QobuzTrack, country: string | undefined, _signal?: AbortSignal) {
+async function enrichAlbum(result: QobuzTrack, country: string | undefined, signal?: AbortSignal) {
     const album = result.album;
     if (!album || album.full || sourceOf(result) === 'qobuz' || !album.id) return;
     const key = `${sourceOf(result)}:${album.id}`;
@@ -89,7 +138,9 @@ async function enrichAlbum(result: QobuzTrack, country: string | undefined, _sig
             try {
                 const res = await axios.get('/api/get-album', {
                     params: { album_id: album.id, source: sourceOf(result) },
-                    headers: { 'Token-Country': country, ...serviceHeaders() }
+                    headers: { 'Token-Country': country, ...serviceHeaders() },
+                    timeout: 2500,
+                    signal
                 });
                 const full = res.data?.data;
                 if (full) {
@@ -121,8 +172,16 @@ export const createDownloadJob = async (
 ) => {
     if ((result as QobuzTrack).album) {
         const formattedTitle = formatCustomTitle(settings.trackName, result as QobuzTrack);
+        const initialSource = sourceOf(result);
+        const initialOutput = outputFor(initialSource, settings);
+        const dedupeKey = [initialSource, String((result as QobuzTrack).id), initialOutput.outputCodec, initialOutput.bitrate, settings.applyMetadata ? 'meta' : 'raw'].join(':');
+        if (activeTrackDownloads.has(dedupeKey)) {
+            toast({ title: 'Already queued', description: 'This song is already being downloaded. Duplicate downloads are ignored.' });
+            return;
+        }
+        activeTrackDownloads.add(dedupeKey);
         await createJob(setStatusBar, formattedTitle, Disc3Icon, async () => {
-            return new Promise(async (resolve) => {
+            const completion = new Promise<void>(async (resolve) => {
                 const controller = new AbortController();
                 const signal = controller.signal;
                 let jobId: string | null = null;
@@ -140,7 +199,14 @@ export const createDownloadJob = async (
                 try {
                     const source = sourceOf(result);
                     const eff = outputFor(source, settings);
-                    await enrichAlbum(result as QobuzTrack, country, signal);
+                    // Album enrichment improves tags, but it must never hold the
+                    // click hostage behind a slow provider detail endpoint. Use
+                    // whatever arrives quickly; the sparse search-row metadata is
+                    // still valid and the queue notification should be immediate.
+                    await Promise.race([
+                        enrichAlbum(result as QobuzTrack, country, signal),
+                        new Promise((resolve) => setTimeout(resolve, 1200))
+                    ]);
                     const track = result as QobuzTrack;
                     const album = track.album as any;
                     const spec = {
@@ -182,6 +248,13 @@ export const createDownloadJob = async (
                     // object storage. Local mode keeps the old concurrent behavior
                     // because the GET itself is the producer.
                     const mode = res.data?.data?.mode;
+                    const toastState = res.data?.data;
+                    toast({
+                        title: toastState?.deduped ? 'Already queued' : toastState?.cached ? 'Ready from cache' : mode === 'queue' ? 'Queued for download' : 'Download started',
+                        description: toastState?.deduped
+                            ? `${formatTitle(track)} is already in the download queue — the existing job will be used.`
+                            : `${formatTitle(track)} — ${formatArtists(track)}`
+                    });
                     const saveProduced = async (outcome?: any) => {
                         const result = await saveUrl(`/api/download-file?job=${job}`, formattedTitle, {
                             signal,
@@ -197,6 +270,20 @@ export const createDownloadJob = async (
                             axios.post('/api/job-status', { id: job }).catch(() => {});
                             return resolve();
                         }
+                        addRecentDownload({
+                            key: `${source}:${track.id}`,
+                            source,
+                            trackId: String(track.id),
+                            title: formatTitle(track),
+                            artist: formatArtists(track),
+                            album: spec.album,
+                            artUrl: spec.artUrl,
+                            ext: outcome?.resultExt,
+                            duration: track.duration,
+                            size: outcome?.total,
+                            isPreview: !!outcome?.isPreview,
+                            downloadedAt: Date.now()
+                        });
                         if (outcome?.isPreview) {
                             const provider = source.charAt(0).toUpperCase() + source.slice(1);
                             toast({
@@ -247,12 +334,30 @@ export const createDownloadJob = async (
                     }
                 }
             });
+            try {
+                await completion;
+            } finally {
+                activeTrackDownloads.delete(dedupeKey);
+            }
+        }, () => activeTrackDownloads.delete(dedupeKey), () => {
+            toast({
+                title: 'Added to download queue',
+                description: `${formatTitle(result)} will start as soon as the current download finishes.`
+            });
         });
     } else {
         const formattedZipTitle = formatCustomTitle(settings.zipName, result as QobuzAlbum);
+        const zipSource = sourceOf(result);
+        const zipOutput = outputFor(zipSource, settings);
+        const zipDedupeKey = ['zip', zipSource, String((result as QobuzAlbum).id), zipOutput.outputCodec, zipOutput.bitrate, settings.applyMetadata ? 'meta' : 'raw', formattedZipTitle].join(':');
+        if (activeTrackDownloads.has(zipDedupeKey)) {
+            toast({ title: 'Already queued', description: 'This album is already being downloaded. Duplicate downloads are ignored.' });
+            return;
+        }
+        activeTrackDownloads.add(zipDedupeKey);
 
         await createJob(setStatusBar, formattedZipTitle, DiscAlbumIcon, async () => {
-            return new Promise(async (resolve) => {
+            return new Promise<void>(async (resolve) => {
                 const controller = new AbortController();
                 const signal = controller.signal;
                 let jobId: string | null = null;
@@ -294,6 +399,11 @@ export const createDownloadJob = async (
                     // zips can be GBs — queue mode waits for the verified archive,
                     // then object storage serves the bytes rather than the web dyno.
                     const mode = res.data?.data?.mode;
+                    const zipQueued = res.data?.data;
+                    toast({
+                        title: zipQueued?.deduped ? 'Already queued' : zipQueued?.cached ? 'Album ready from cache' : mode === 'queue' ? 'Album queued for download' : 'Album download started',
+                        description: zipQueued?.deduped ? `${formatTitle(result)} is already in the download queue — the existing job will be used.` : formatTitle(result)
+                    });
                     const saveZip = async (outcome?: any) => {
                         const result = await saveUrl(`/api/album-zip?job=${job}`, formattedZipTitle + '.zip', { signal, navIfNoPicker: true, forceNav: mode === 'queue' });
                         if (result.method === 'aborted') {
@@ -347,6 +457,11 @@ export const createDownloadJob = async (
                         resolve();
                     }
                 }
+            }).finally(() => activeTrackDownloads.delete(zipDedupeKey));
+        }, () => activeTrackDownloads.delete(zipDedupeKey), () => {
+            toast({
+                title: 'Album added to download queue',
+                description: `${formatTitle(result)} will start as soon as the current download finishes.`
             });
         });
     }

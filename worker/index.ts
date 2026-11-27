@@ -17,7 +17,7 @@ import {
     cancelRequested, QUEUE_APPLE, QUEUE_GENERIC, queueDepths, jobCounters, cmd, LEASE_MS, publicErrorMessage
 } from '../lib/queue';
 import { cacheEnabled, cachePutFile, presignGet, cacheKeyFor, previewCacheKeyFor, objectKey, zipCacheKeyFor, previewZipCacheKeyFor } from '../lib/download-cache';
-import { stageToFile, probeFileDuration, classifyDlError, pipelineSlots, artifactFilename, type DownloadSpec } from '../lib/server-download';
+import { stageToFile, probeFileDuration, classifyDlError, pipelineSlots, artifactFilename, setProgress, type DownloadSpec } from '../lib/server-download';
 import { produceAlbumZipFile, type AlbumZipSpec } from '../lib/album-zip-produce';
 import { hydrateSessionsFromRedis } from '../lib/platforms/native-tools';
 import { hydrateTokenPoolFromRedis, hydrateSettingsFromRedis } from '../lib/token-pool';
@@ -29,7 +29,7 @@ axios.defaults.httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 })
 
 const CAPS = (process.env.WORKER_CAPS ?? 'generic').split(',').map((s) => s.trim()).filter(Boolean);
 const QUEUES = [...(CAPS.includes('apple') ? [QUEUE_APPLE] : []), ...(CAPS.includes('generic') ? [QUEUE_GENERIC] : [])];
-const POLL_MS = Number(process.env.WORKER_POLL_MS ?? 2500);
+const POLL_MS = Number(process.env.WORKER_POLL_MS ?? 500);
 const CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY ?? 1));
 const MAX_ATTEMPTS = Math.max(1, Number(process.env.JOB_MAX_ATTEMPTS ?? 3));
 const INLINE_RESULT_MAX = 8 * 1024 * 1024;
@@ -98,8 +98,12 @@ async function uploadArtifact(args: {
     if (!size) throw new Error('produced artifact is empty');
     if (cacheEnabled()) {
         const key = objectKey(args.cacheKey, args.ext);
-        await jobSet(args.id, { stage: 'processing', label: 'Uploading artifact', total: size }).catch(() => {});
-        const uploaded = await cachePutFile(key, args.file, size);
+        setProgress(args.id, { stage: 'uploading', label: 'Uploading artifact', sent: 0, total: size });
+        let maxUploaded = 0;
+        const uploaded = await cachePutFile(key, args.file, size, (bytes, total) => {
+            maxUploaded = Math.max(maxUploaded, bytes);
+            setProgress(args.id, { stage: 'uploading', sent: maxUploaded, total });
+        });
         return {
             sent: size,
             total: size,
@@ -336,7 +340,7 @@ async function main() {
             const claim = await dequeueJob(QUEUES, WORKER_ID, LEASE_MS);
             if (!claim) {
                 idle++;
-                await sleep(Math.min(POLL_MS * Math.ceil(idle / 8), 30_000));
+                await sleep(Math.min(POLL_MS * Math.ceil(idle / 4), 2_000));
                 continue;
             }
             idle = 0;

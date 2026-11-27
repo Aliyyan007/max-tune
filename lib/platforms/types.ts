@@ -42,7 +42,7 @@ export class DownloadError extends Error {
 
 export interface PlatformAdapter {
     source: PlatformSource;
-    search(query: string, limit: number, offset: number, ctx: RequestContext): Promise<QobuzSearchResults>;
+    search(query: string, limit: number, offset: number, ctx: RequestContext, light?: boolean): Promise<QobuzSearchResults>;
     getAlbumInfo(albumId: string, ctx: RequestContext): Promise<FetchedQobuzAlbum>;
     getArtist(artistId: string, ctx: RequestContext, artistName?: string): Promise<any>;
     getArtistReleases(artistId: string, releaseType: string, limit: number, offset: number, ctx: RequestContext, artistName?: string): Promise<any>;
