@@ -308,6 +308,7 @@ export const createDownloadJob = async (
                         finishProduced(outcome);
                     };
                     const liveUrl = res.data?.data?.liveUrl;
+                    const liveNavUrl = `/api/download-file?job=${encodeURIComponent(job)}&live=1`;
                     let liveStarted = false;
                     let liveStartAttempted = false;
                     const liveDecisions: Promise<void>[] = [];
@@ -319,9 +320,19 @@ export const createDownloadJob = async (
                                 // Probe first so a wrong/expired worker URL falls back
                                 // to the normal published-artifact path instead of
                                 // silently opening a failed browser navigation.
-                                const probe = await fetch(liveUrl, { method: 'HEAD', cache: 'no-store', signal });
+                                const probeCtl = new AbortController();
+                                const cancelProbe = () => probeCtl.abort();
+                                const probeTimeout = setTimeout(() => probeCtl.abort(), 5000);
+                                signal.addEventListener('abort', cancelProbe, { once: true });
+                                let probe: Response;
+                                try {
+                                    probe = await fetch(liveNavUrl, { method: 'HEAD', cache: 'no-store', signal: probeCtl.signal });
+                                } finally {
+                                    clearTimeout(probeTimeout);
+                                    signal.removeEventListener('abort', cancelProbe);
+                                }
                                 if (!probe.ok) return;
-                                await saveUrl(liveUrl, formattedTitle, { signal, forceNav: true });
+                                await saveUrl(liveNavUrl, formattedTitle, { signal, forceNav: true });
                                 liveStarted = true;
                                 toast({
                                     title: 'Fast download started',

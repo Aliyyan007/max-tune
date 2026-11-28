@@ -105,11 +105,31 @@ export async function POST(request: NextRequest) {
     }
 }
 
+export async function HEAD(request: NextRequest) {
+    if (!queueEnabled()) return new NextResponse(null, { status: 405 });
+    const url = new URL(request.url);
+    const id = url.searchParams.get('job') ?? '';
+    if (url.searchParams.get('live') !== '1') return new NextResponse(null, { status: 405 });
+    const j = await jobGet(id).catch(() => null);
+    if (!j) return new NextResponse(null, { status: 410, headers: { 'Cache-Control': 'no-store' } });
+    if (j.stage === 'error') return new NextResponse(null, { status: 502, headers: { 'Cache-Control': 'no-store' } });
+    const liveReady = j.liveReady === '1' || j.liveReady === 'true' || j.liveReady === true;
+    const liveExpiresAt = Number(j.liveExpiresAt ?? 0);
+    const liveUrl = liveReady && (!liveExpiresAt || liveExpiresAt > Date.now()) ? liveUrlForJob(id) : null;
+    if (liveUrl) return NextResponse.redirect(liveUrl, 302);
+    return new NextResponse(null, {
+        status: j.stage === 'done' ? 410 : 202,
+        headers: { 'Retry-After': '1', 'Cache-Control': 'no-store' }
+    });
+}
+
 // GET ?job=<id>: streams platform bytes → ffmpeg → response so Chrome's download
 // manager shows real progress while the file is still being fetched+tagged.
 export async function GET(request: NextRequest) {
     try {
-        const id = new URL(request.url).searchParams.get('job') ?? '';
+        const url = new URL(request.url);
+        const id = url.searchParams.get('job') ?? '';
+        const wantsLive = url.searchParams.get('live') === '1';
 
         if (queueEnabled()) {
             // Queue mode is deliberately non-blocking: web/serverless requests
@@ -118,6 +138,15 @@ export async function GET(request: NextRequest) {
             const j = await jobGet(id);
             if (!j) return failResponse(request, 'download job expired — retry', 410);
             if (j.stage === 'error') return failResponse(request, publicJobView(j).error ?? 'download failed', 502);
+            if (wantsLive) {
+                const liveReady = j.liveReady === '1' || j.liveReady === 'true' || j.liveReady === true;
+                const liveExpiresAt = Number(j.liveExpiresAt ?? 0);
+                const liveUrl = liveReady && (!liveExpiresAt || liveExpiresAt > Date.now()) ? liveUrlForJob(id) : null;
+                if (liveUrl) return NextResponse.redirect(liveUrl, 302);
+                if (j.stage !== 'done') {
+                    return NextResponse.json({ success: false, error: 'live artifact is not ready yet', stage: j.stage ?? 'queued' }, { status: 202, headers: { 'Retry-After': '1', 'Cache-Control': 'no-store' } });
+                }
+            }
             if (j.stage !== 'done') {
                 return NextResponse.json({ success: false, error: 'job not ready', stage: j.stage ?? 'queued' }, { status: 202, headers: { 'Retry-After': '2', 'Cache-Control': 'no-store' } });
             }

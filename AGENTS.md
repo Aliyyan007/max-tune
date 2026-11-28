@@ -263,7 +263,10 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
   download failure, backpressure, and container finalization are redesigned
   deliberately. `WORKER_PUBLIC_URL` and the shared job-encryption secret derive
   the HMAC URL token; `LIVE_MAX_STREAMS` bounds direct streams and normal R2
-  delivery remains the fallback.
+  delivery remains the fallback. Browser handoff must go through the same-origin
+  `/api/download-file?job=<id>&live=1` redirect. A programmatically clicked
+  direct cross-origin worker anchor can be ignored by Chrome even when the CORS
+  HEAD probe succeeds, leaving no download at all.
 - The legacy `/api/stream-audio` route performs provider work in the web process
   and is disabled in production unless `ENABLE_LEGACY_STREAM_AUDIO=1`. Keep new
   download work in queue workers.
