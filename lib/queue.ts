@@ -279,12 +279,27 @@ for _, id in ipairs(ids) do
   local lease = tonumber(redis.call('HGET', key, 'leaseUntil') or '0') or 0
   if state == 'processing' and lease <= now then
     local cancelled = redis.call('HGET', key, 'cancelRequested') or ''
+    local attempt = tonumber(redis.call('HGET', key, 'attempt') or '1') or 1
+    local maxAttempts = tonumber(ARGV[3]) or 3
     if cancelled == '1' or cancelled == 'true' then
       redis.call('HSET', key,
         'state', 'error',
         'stage', 'error',
         'error', 'cancelled',
         'errorKind', 'cancelled',
+        'worker', '',
+        'leaseUntil', 0,
+        'finishedAt', now,
+        'at', now
+      )
+      redis.call('ZREM', inflight, id)
+      redis.call('HINCRBY', 'stats:jobs', 'failed', 1)
+    elseif attempt >= maxAttempts then
+      redis.call('HSET', key,
+        'state', 'error',
+        'stage', 'error',
+        'error', 'worker stopped repeatedly before producing the artifact',
+        'errorKind', 'tool',
         'worker', '',
         'leaseUntil', 0,
         'finishedAt', now,
@@ -315,9 +330,9 @@ end
 return recovered
 `;
 
-export async function recoverStaleJobs(queue: string, limit = 20): Promise<number> {
+export async function recoverStaleJobs(queue: string, limit = 20, maxAttempts = Number(process.env.JOB_MAX_ATTEMPTS ?? 3)): Promise<number> {
     if (!queueEnabled()) return 0;
-    return Number((await evalScript(RECOVER_LUA, [queue, INFLIGHT], [Date.now(), limit])) ?? 0);
+    return Number((await evalScript(RECOVER_LUA, [queue, INFLIGHT], [Date.now(), limit, maxAttempts])) ?? 0);
 }
 
 const RECOVER_DELAYED_LUA = `

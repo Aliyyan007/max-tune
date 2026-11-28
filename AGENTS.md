@@ -108,6 +108,11 @@ embedded-art checks), admin auth, and the album-zip flow for every platform.
 - amdl needs `media.get-m3u8-mode: "all"` (avoids Invalid CKC) and canonical
   `…/album/<collectionId>?i=<trackId>` URLs — bare `/song/<id>` 404s. Both are
   handled in `native-tools.ts`.
+- Keep `general.max-memory-limit` tiny in generated amdl configs
+  (`AMDL_MAX_MEMORY_LIMIT_MB`, default 1). Larger values make amdl buffer the
+  encrypted input and decrypted output in memory; large hi-res jobs can OOM a
+  512Mi worker before the quality ladder reaches ALAC/AAC fallback. Disk
+  streaming is the intended production path.
 - Public wrapper federation is gRPC-only (`wm.wol.moe`) — no public lite-HTTP
   endpoints exist; multi-region means a second local wrapper + account.
 
@@ -223,6 +228,10 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
 - Workers use file-backed production (`stageToFile`) and streamed R2 uploads
   (`cachePutFile`). Do not reintroduce `produceTrackBytes`/`tagAndEncode` in
   worker hot paths; those buffer whole tracks and tagged outputs in memory.
+- Stale-lease recovery is bounded by `JOB_MAX_ATTEMPTS`. Once the final claimed
+  attempt loses its lease, the job must fail terminally instead of requeueing
+  forever; otherwise one repeatedly crashing worker job can restart-loop the
+  whole service.
 - Album ZIPs are queue jobs too (`kind=zip`) and are written by
   `lib/album-zip-produce.ts` as valid store-only ZIPs on disk. Python
   `zipfile.testzip()` validation passed locally; keep CRC/central-directory

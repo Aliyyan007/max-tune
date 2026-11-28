@@ -10,6 +10,7 @@ import ffmpegPath from 'ffmpeg-static';
 export type NativeResult = { file: string; size: number; format: string };
 
 const TIMEOUT_MS = 300000; // 5 min — downloads can be slow
+const AMDL_MAX_MEMORY_LIMIT_MB = Math.max(1, Number(process.env.AMDL_MAX_MEMORY_LIMIT_MB ?? 1) || 1);
 
 function sanitizeToolLog(s: string): string {
     return s
@@ -70,9 +71,10 @@ export function runNativeToolFull(
         if (childRef) childRef.p = proc;
         let out = '';
         let err = '';
+        let timedOut = false;
         const kill = setTimeout(() => {
+            timedOut = true;
             proc.kill('SIGKILL');
-            reject(new Error(`${path.basename(cmd)} timed out after ${Math.round(timeoutMs / 1000)}s`));
         }, timeoutMs);
         proc.stdout.on('data', (d) => (out += d.toString()));
         proc.stderr.on('data', (d) => (err += d.toString()));
@@ -82,6 +84,7 @@ export function runNativeToolFull(
         });
         proc.on('close', (code) => {
             clearTimeout(kill);
+            if (timedOut) err = `${err}\n${path.basename(cmd)} timed out after ${Math.round(timeoutMs / 1000)}s`.trim();
             resolve({ out, err, code });
         });
     });
@@ -806,6 +809,7 @@ export async function downloadAppleNative(
             `  lite-server: "${activeWrapper.url}"`,
             `  media-user-token: "${mediaToken}"`,
             `  storefront: "${useStorefront}"`,
+            `  max-memory-limit: ${AMDL_MAX_MEMORY_LIMIT_MB}`,
             '  exit-on-error: true',
             'media:',
             // 'all' mode avoids Invalid CKC / EOF — narrow manifests drop key streams
@@ -910,6 +914,8 @@ export async function downloadAppleNative(
             }
             lastErr = (err.trim() || o.trim() || `amdl exit code ${code}`).slice(-800);
             console.warn(`[apple] amdl ${q} attempt ${attempt + 1} failed: ${sanitizeToolLog(lastErr)}`);
+            const hiResAssetStall = q === 'alac-hi' && /decode mdat pos \d+: response timed out/i.test(lastErr);
+            if (hiResAssetStall) break;
             if (!AMDL_RETRYABLE.test(lastErr) && attempt >= 1) break; // non-network after a retry → next quality
             if (!AMDL_RETRYABLE.test(lastErr) && attempt === 0) break;
         }
