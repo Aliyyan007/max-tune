@@ -11,6 +11,7 @@ import http from 'http';
 import https from 'https';
 import os from 'os';
 import fs from 'fs';
+import { pipeline } from 'stream';
 import axios from 'axios';
 import {
     dequeueJob, jobDone, jobGet, jobSet, queueEnabled, touchInflight, retryJob,
@@ -280,7 +281,7 @@ async function handleLiveRequest(req: http.IncomingMessage, res: http.ServerResp
     body.on('data', noteProgress);
     body.on('error', () => res.destroy());
     res.writeHead(status, headers);
-    body.pipe(res);
+    pipeline(body, res, () => {});
 }
 
 async function uploadArtifact(args: {
@@ -443,7 +444,7 @@ async function processClaim(claim: NonNullable<Awaited<ReturnType<typeof dequeue
             ? await processZip(id, payload, () => sawCancel)
             : await processTrack(id, payload as DownloadSpec, ac.signal);
         if (sawCancel || ac.signal.aborted) throw new Error('cancelled');
-        await finishJob(id, true, result, token);
+        await finishJob(id, true, { ...result, liveReady: '0' }, token);
         metrics.completed++;
         metrics.bytesProduced += Number(result.sent ?? 0);
         console.log(`[worker] ${short} done (${result.sent ?? 0}B)`);

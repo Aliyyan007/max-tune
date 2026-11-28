@@ -25,6 +25,9 @@ const MIME: Record<string, string> = {
     wav: 'audio/wav'
 };
 
+const publishedArtifactReady = (j: Record<string, any>): boolean =>
+    j?.stage === 'done' && Boolean(j.resultUrl || (j.resultJson?.objectKey && j.resultName) || j.resultB64);
+
 // POST: client submits the full download spec (settings + service tokens) → {job}
 // so the GET can be a plain <a download> navigation that Chrome owns end-to-end.
 export async function POST(request: NextRequest) {
@@ -115,7 +118,7 @@ export async function HEAD(request: NextRequest) {
     if (j.stage === 'error') return new NextResponse(null, { status: 502, headers: { 'Cache-Control': 'no-store' } });
     const liveReady = j.liveReady === '1' || j.liveReady === 'true' || j.liveReady === true;
     const liveExpiresAt = Number(j.liveExpiresAt ?? 0);
-    const liveUrl = liveReady && (!liveExpiresAt || liveExpiresAt > Date.now()) ? liveUrlForJob(id) : null;
+    const liveUrl = liveReady && !publishedArtifactReady(j) && (!liveExpiresAt || liveExpiresAt > Date.now()) ? liveUrlForJob(id) : null;
     if (liveUrl) return NextResponse.redirect(liveUrl, 302);
     return new NextResponse(null, {
         status: j.stage === 'done' ? 410 : 202,
@@ -141,7 +144,7 @@ export async function GET(request: NextRequest) {
             if (wantsLive) {
                 const liveReady = j.liveReady === '1' || j.liveReady === 'true' || j.liveReady === true;
                 const liveExpiresAt = Number(j.liveExpiresAt ?? 0);
-                const liveUrl = liveReady && (!liveExpiresAt || liveExpiresAt > Date.now()) ? liveUrlForJob(id) : null;
+                const liveUrl = liveReady && !publishedArtifactReady(j) && (!liveExpiresAt || liveExpiresAt > Date.now()) ? liveUrlForJob(id) : null;
                 if (liveUrl) return NextResponse.redirect(liveUrl, 302);
                 if (j.stage !== 'done') {
                     return NextResponse.json({ success: false, error: 'live artifact is not ready yet', stage: j.stage ?? 'queued' }, { status: 202, headers: { 'Retry-After': '1', 'Cache-Control': 'no-store' } });

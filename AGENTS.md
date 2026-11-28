@@ -271,7 +271,10 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
   Chrome even when the CORS HEAD probe succeeds, leaving no download at all.
   Once accepted, live streams must not be killed merely because the session TTL
   used for new handoffs expires; use the separate idle/maximum stream limits so
-  slow large downloads can finish.
+  slow large downloads can finish. Workers clear `liveReady` on terminal success,
+  and the web endpoint must prefer the published R2 artifact once it exists —
+  the worker lane is only a pre-publication fast path, not a replacement for CDN
+  delivery.
 - The legacy `/api/stream-audio` route performs provider work in the web process
   and is disabled in production unless `ENABLE_LEGACY_STREAM_AUDIO=1`. Keep new
   download work in queue workers.
