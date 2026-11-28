@@ -264,9 +264,14 @@ namespaces, no QEMU — near-native speed); a Windows machine runs
   deliberately. `WORKER_PUBLIC_URL` and the shared job-encryption secret derive
   the HMAC URL token; `LIVE_MAX_STREAMS` bounds direct streams and normal R2
   delivery remains the fallback. Browser handoff must go through the same-origin
-  `/api/download-file?job=<id>&live=1` redirect. A programmatically clicked
-  direct cross-origin worker anchor can be ignored by Chrome even when the CORS
-  HEAD probe succeeds, leaving no download at all.
+  `/api/download-file?job=<id>&live=1` redirect without a client-side probe:
+  the endpoint already falls back to the published artifact when appropriate,
+  while slow production probes can suppress the handoff entirely. A
+  programmatically clicked direct cross-origin worker anchor can be ignored by
+  Chrome even when the CORS HEAD probe succeeds, leaving no download at all.
+  Once accepted, live streams must not be killed merely because the session TTL
+  used for new handoffs expires; use the separate idle/maximum stream limits so
+  slow large downloads can finish.
 - The legacy `/api/stream-audio` route performs provider work in the web process
   and is disabled in production unless `ENABLE_LEGACY_STREAM_AUDIO=1`. Keep new
   download work in queue workers.

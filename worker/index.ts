@@ -106,6 +106,8 @@ type LiveSession = {
 const liveSessions = new Map<string, LiveSession>();
 const LIVE_SESSION_TTL_MS = Number(process.env.LIVE_SESSION_TTL_MS ?? 10 * 60 * 1000);
 const LIVE_IDLE_CLEANUP_MS = Number(process.env.LIVE_IDLE_CLEANUP_MS ?? 45 * 1000);
+const LIVE_STREAM_IDLE_TIMEOUT_MS = Number(process.env.LIVE_STREAM_IDLE_TIMEOUT_MS ?? 10 * 60 * 1000);
+const LIVE_STREAM_MAX_DURATION_MS = Number(process.env.LIVE_STREAM_MAX_DURATION_MS ?? 2 * 60 * 60 * 1000);
 const LIVE_MAX_STREAMS = Math.max(1, Number(process.env.LIVE_MAX_STREAMS ?? 6));
 
 function activeLiveStreams(): number {
@@ -254,14 +256,28 @@ async function handleLiveRequest(req: http.IncomingMessage, res: http.ServerResp
     session.activeStreams++;
     clearLiveTimer(session);
     let released = false;
+    const startedAt = Date.now();
+    let lastProgressAt = startedAt;
+    const noteProgress = () => {
+        lastProgressAt = Date.now();
+    };
+    const watchdog = setInterval(() => {
+        const now = Date.now();
+        if (now - lastProgressAt >= LIVE_STREAM_IDLE_TIMEOUT_MS || now - startedAt >= LIVE_STREAM_MAX_DURATION_MS) {
+            res.destroy(new Error('live stream timeout'));
+        }
+    }, Math.min(30_000, Math.max(1_000, Math.floor(LIVE_STREAM_IDLE_TIMEOUT_MS / 3))));
+    watchdog.unref?.();
     const release = () => {
         if (released) return;
         released = true;
+        clearInterval(watchdog);
         releaseLiveStream(session);
     };
     res.on('close', release);
-    res.setTimeout(LIVE_SESSION_TTL_MS, () => res.destroy(new Error('live stream timeout')));
+    res.on('drain', noteProgress);
     const body = fs.createReadStream(session.file, { start, end, highWaterMark: 1 << 20 });
+    body.on('data', noteProgress);
     body.on('error', () => res.destroy());
     res.writeHead(status, headers);
     body.pipe(res);
