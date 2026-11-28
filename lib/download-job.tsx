@@ -317,21 +317,9 @@ export const createDownloadJob = async (
                         liveStartAttempted = true;
                         liveDecisions.push((async () => {
                             try {
-                                // Probe first so a wrong/expired worker URL falls back
-                                // to the normal published-artifact path instead of
-                                // silently opening a failed browser navigation.
-                                const probeCtl = new AbortController();
-                                const cancelProbe = () => probeCtl.abort();
-                                const probeTimeout = setTimeout(() => probeCtl.abort(), 5000);
-                                signal.addEventListener('abort', cancelProbe, { once: true });
-                                let probe: Response;
-                                try {
-                                    probe = await fetch(liveNavUrl, { method: 'HEAD', cache: 'no-store', signal: probeCtl.signal });
-                                } finally {
-                                    clearTimeout(probeTimeout);
-                                    signal.removeEventListener('abort', cancelProbe);
-                                }
-                                if (!probe.ok) return;
+                                // The same-origin endpoint already falls back to the
+                                // published artifact when the worker session has expired,
+                                // so a probe would only delay or suppress the handoff.
                                 await saveUrl(liveNavUrl, formattedTitle, { signal, forceNav: true });
                                 liveStarted = true;
                                 toast({
